@@ -26,7 +26,6 @@ def normalize_requirements(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = None
     return df[["Requirement ID", "Verification ID", "Requirements"]].copy()
 
-
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     """
     Convert a DataFrame to Excel bytes using openpyxl.
@@ -36,7 +35,6 @@ def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
         df.to_excel(w, index=False)
     buf.seek(0)
     return buf.read()
-
 
 def basic_guardrails_df(df: pd.DataFrame, required_cols: List[str]) -> pd.DataFrame:
     """
@@ -49,7 +47,6 @@ def basic_guardrails_df(df: pd.DataFrame, required_cols: List[str]) -> pd.DataFr
             if not val or val in {"NA", TBD}:
                 issues.append((i, c, "Missing or TBD"))
     return pd.DataFrame(issues, columns=["row_index", "column", "issue"]) if issues else pd.DataFrame(columns=["row_index", "column", "issue"])
-
 
 def fill_tbd(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     """
