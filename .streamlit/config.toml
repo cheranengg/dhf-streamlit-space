@@ -1,0 +1,14 @@
+[browser]
+gatherUsageStats = false
+
+[server]
+# Increase to handle large Excel inputs in Spaces
+maxUploadSize = 200
+enableXsrfProtection = true
+# Optional: explicitly set the port if needed in Spaces
+# port = 7860
+# address = "0.0.0.0"
+
+[theme]
+base = "light"
+primaryColor = "#2E7D32"
