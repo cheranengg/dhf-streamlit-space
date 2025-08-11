@@ -5,6 +5,12 @@ import json
 from typing import Optional
 
 try:
+    import streamlit as st
+    _HAS_ST = True
+except Exception:
+    _HAS_ST = False
+
+try:
     from pydrive2.auth import GoogleAuth
     from pydrive2.drive import GoogleDrive
     _HAS_DRIVE = True
@@ -12,17 +18,24 @@ except Exception:
     GoogleDrive = None  # type: ignore
     _HAS_DRIVE = False
 
+def _get_secret(key: str, default: str = "") -> str:
+    if _HAS_ST:
+        try:
+            return st.secrets.get(key, default)
+        except Exception:
+            pass
+    return os.environ.get(key, default)
 
 def init_drive() -> Optional["GoogleDrive"]:
     """
     Initialize Google Drive client using a service account.
-    Expects env var SERVICE_ACCOUNT_JSON to contain the full JSON string.
+    Expects SERVICE_ACCOUNT_JSON in Streamlit secrets or environment.
     Returns GoogleDrive instance or None if not configured.
     """
     if not _HAS_DRIVE:
         return None
 
-    svc_json = os.environ.get("SERVICE_ACCOUNT_JSON")
+    svc_json = _get_secret("SERVICE_ACCOUNT_JSON", "")
     if not svc_json:
         return None
 
@@ -36,7 +49,7 @@ def init_drive() -> Optional["GoogleDrive"]:
         # Preferred pydrive2 helper for service accounts
         gauth.LoadServiceAccountCredentials(svc_path)
     except Exception:
-        # Fallback path
+        # Fallback path (older pydrive2)
         gauth.settings.update({
             "client_config_backend": "service",
             "service_config": {
@@ -48,7 +61,6 @@ def init_drive() -> Optional["GoogleDrive"]:
         gauth.ServiceAuth()
 
     return GoogleDrive(gauth)
-
 
 def drive_upload_bytes(drive: "GoogleDrive", folder_id: str, filename: str, data: bytes) -> str:
     """
