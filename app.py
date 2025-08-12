@@ -146,7 +146,7 @@ with colB:
     sample = "Requirement ID,Verification ID,Requirements\nPR-001,VER-001,System shall ..."
     pasted = st.text_area("Paste as CSV (with headers)", value="", height=140, placeholder=sample)
 
-run_btn = st.button("▶️ Generate DHF Package", type="primary")
+run_btn = st.button("▶️ Generate DHF Packages", type="primary")
 
 if run_btn:
     # -------- Parse Requirements --------
