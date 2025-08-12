@@ -1,30 +1,33 @@
-# app.py — DHF Streamlit UI (Preview + Single ZIP Download)
-# ---------------------------------------------------------
+# app.py — DHF Streamlit UI (Preview + ZIP Download)
+# --------------------------------------------------
 # - Input: Product Requirements (Excel upload OR pasted CSV)
 # - Calls FastAPI backend (HA → DVP → Trace Matrix) with bearer token
-# - Previews only (no editing)
-# - Exports: Hazard_Analysis.xlsx, Design_Verification_Protocol.xlsx, Trace_Matrix.xlsx
-# - Packs all 3 into one ZIP for a single-click download
-# - (Optional) Uploads to Google Drive if SERVICE_ACCOUNT_JSON + DRIVE_FOLDER_ID are set
+# - Guardrails are ON (missing/empty => "TBD - Human / SME input")
+# - Exports three Excel files zipped into one download
+# - (Optional) uploads the three Excel files to Google Drive if SERVICE_ACCOUNT_JSON + DRIVE_FOLDER_ID are set
 
 import os
 import io
 import json
 import zipfile
 import typing as t
+
 import pandas as pd
 import streamlit as st
 import requests
 
 # ---------------- Constants & Secrets ----------------
 TBD = "TBD - Human / SME input"
-BACKEND_URL = st.secrets.get("BACKEND_URL", "http://localhost:8080").rstrip("/")
+
+BACKEND_URL = st.secrets.get("BACKEND_URL", "http://localhost:8080")
 BACKEND_TOKEN = st.secrets.get("BACKEND_TOKEN", "dev-token")
+
+# Optional Google Drive upload
 DEFAULT_DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
 OUTPUT_DIR = st.secrets.get("OUTPUT_DIR", os.path.abspath("./streamlit_outputs"))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# --------------- Google Drive (pydrive2) ---------------
+# ---------------- Optional Google Drive (pydrive2) ----------------
 _HAS_DRIVE = True
 try:
     from pydrive2.auth import GoogleAuth
@@ -34,6 +37,7 @@ except Exception:
 
 
 def init_drive() -> t.Optional["GoogleDrive"]:
+    """Initialize Google Drive client from SERVICE_ACCOUNT_JSON in secrets."""
     if not _HAS_DRIVE:
         return None
     svc_json = st.secrets.get("SERVICE_ACCOUNT_JSON")
@@ -47,19 +51,21 @@ def init_drive() -> t.Optional["GoogleDrive"]:
     try:
         gauth.LoadServiceAccountCredentials(svc_path)
     except Exception:
+        # fallback for older pydrive2 versions
         gauth.settings.update({
-            "client_config_backend": "service",
-            "service_config": {
-                "client_json_file_path": svc_path,
-                "client_user_email": json.loads(svc_json).get("client_email", ""),
+            'client_config_backend': 'service',
+            'service_config': {
+                'client_json_file_path': svc_path,
+                'client_user_email': json.loads(svc_json).get('client_email', ''),
             },
-            "oauth_scope": ["https://www.googleapis.com/auth/drive"],
+            'oauth_scope': ['https://www.googleapis.com/auth/drive']
         })
         gauth.ServiceAuth()
     return GoogleDrive(gauth)
 
 
 def drive_upload_bytes(drive: "GoogleDrive", folder_id: str, filename: str, data: bytes) -> str:
+    """Upload a bytes object to Google Drive and return the file id."""
     file = drive.CreateFile({"title": filename, "parents": [{"id": folder_id}]})
     file.content = io.BytesIO(data)
     file.Upload()
@@ -68,9 +74,10 @@ def drive_upload_bytes(drive: "GoogleDrive", folder_id: str, filename: str, data
 
 # ---------------- Helpers ----------------
 def normalize_requirements(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize uploaded/pasted requirements to three canonical columns."""
     rename_map = {}
     for c in df.columns:
-        lc = c.strip().lower()
+        lc = str(c).strip().lower()
         if lc in {"requirement id", "req id", "requirement_id"}:
             rename_map[c] = "Requirement ID"
         elif lc in {"verification id", "verification_id", "verif id"}:
@@ -85,6 +92,7 @@ def normalize_requirements(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """Serialize a dataframe to Excel bytes (OpenPyXL)."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False)
@@ -92,18 +100,32 @@ def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return buf.read()
 
 
+def basic_guardrails_df(df: pd.DataFrame, required_cols: t.List[str]) -> pd.DataFrame:
+    """Very light guardrail pass to flag missing key fields."""
+    issues = []
+    for i, row in df.iterrows():
+        for c in required_cols:
+            val = str(row.get(c, "")).strip()
+            if not val or val in {"NA", TBD}:
+                issues.append((i, c, "Missing or TBD"))
+    return pd.DataFrame(issues, columns=["row_index", "column", "issue"]) if issues else pd.DataFrame(columns=["row_index", "column", "issue"])
+
+
 def fill_tbd(df: pd.DataFrame, cols: t.List[str]) -> pd.DataFrame:
+    """Replace None/empty/NA with our standard TBD token on selected columns."""
     out = df.copy()
     for c in cols:
         if c not in out.columns:
             out[c] = TBD
         out[c] = out[c].fillna(TBD)
         out.loc[out[c].astype(str).str.strip().eq(""), c] = TBD
+        out.loc[out[c].astype(str).str.upper().eq("NA"), c] = TBD
     return out
 
 
 def call_backend(endpoint: str, payload: dict) -> dict:
-    url = f"{BACKEND_URL}{endpoint}"
+    """POST a payload to the backend with bearer auth and return JSON."""
+    url = f"{BACKEND_URL.rstrip('/')}{endpoint}"
     headers = {"Authorization": f"Bearer {BACKEND_TOKEN}", "Content-Type": "application/json"}
     r = requests.post(url, headers=headers, json=payload, timeout=1200)
     if r.status_code >= 400:
@@ -114,14 +136,14 @@ def call_backend(endpoint: str, payload: dict) -> dict:
 # ---------------- UI ----------------
 st.set_page_config(page_title="DHF Automation – Infusion Pump", layout="wide")
 st.title("🧩 DHF Automation – Infusion Pump")
-st.caption("Requirements → Hazard Analysis → DVP → Trace Matrix | Guardrails + Preview | Export to Excel (+ optional Google Drive)")
+st.caption("Requirements → Hazard Analysis → DVP → Trace Matrix | Guardrails + Preview | One-click ZIP download")
 
 st.markdown("**Provide Product Requirements** (choose one):")
 colA, colB = st.columns(2)
 with colA:
     uploaded = st.file_uploader("Upload Product Requirements (Excel .xlsx)", type=["xlsx", "xls"])
 with colB:
-    sample = "Requirement ID,Verification ID,Requirements\nPR-001,VER-001,The pump shall ..."
+    sample = "Requirement ID,Verification ID,Requirements\nPR-001,VER-001,System shall ..."
     pasted = st.text_area("Paste as CSV (with headers)", value="", height=140, placeholder=sample)
 
 run_btn = st.button("▶️ Generate DHF Package", type="primary")
@@ -144,13 +166,14 @@ if run_btn:
         else:
             st.error("Please upload an Excel file or paste CSV text.")
             st.stop()
+
         req_df = normalize_requirements(req_df)
 
     st.success(f"Loaded {len(req_df)} requirements.")
     st.dataframe(req_df.head(20), use_container_width=True)
 
-    # -------- Backend: Hazard Analysis --------
-    with st.spinner("Running Hazard Analysis (backend)..."):
+    # -------- Call Backend: HA --------
+    with st.spinner("Running Hazard Analysis (backend)... this can take a while"):
         ha_payload = {
             "requirements": [
                 {
@@ -175,7 +198,7 @@ if run_btn:
     st.subheader("Hazard Analysis (preview)")
     st.dataframe(ha_df.head(20), use_container_width=True)
 
-    # -------- Backend: DVP --------
+    # -------- Call Backend: DVP --------
     with st.spinner("Generating Design Verification Protocol (backend)..."):
         dvp_payload = {
             "requirements": ha_payload["requirements"],
@@ -189,7 +212,7 @@ if run_btn:
     st.subheader("Design Verification Protocol (preview)")
     st.dataframe(dvp_df.head(20), use_container_width=True)
 
-    # -------- Backend: Trace Matrix --------
+    # -------- Call Backend: Trace Matrix --------
     with st.spinner("Building Trace Matrix (backend)..."):
         tm_payload = {
             "requirements": ha_payload["requirements"],
@@ -209,24 +232,30 @@ if run_btn:
     st.subheader("Trace Matrix (preview)")
     st.dataframe(tm_df.head(20), use_container_width=True)
 
-    # -------- Exports (Create 3 Excel files) --------
-    st.subheader("Export")
+    # -------- Preview-only Guardrails (no editing) --------
+    st.subheader("Human-in-the-Loop (preview only)")
+    issues = basic_guardrails_df(tm_df, ["verification_id", "requirement_id", "requirements"])
+    if issues is not None and not issues.empty:
+        st.info(f"Guardrails flagged {len(issues)} issue(s). Review the Trace Matrix above before export.")
+    else:
+        st.success("No guardrail issues detected in the Trace Matrix.")
 
+    # -------- Prepare Exports --------
     ha_export_cols = [
-        "requirement_id","risk_id","risk_to_health","hazard","hazardous_situation",
-        "harm","sequence_of_events","severity_of_harm","p0","p1","poh","risk_index","risk_control",
+        "requirement_id", "risk_id", "risk_to_health", "hazard", "hazardous_situation",
+        "harm", "sequence_of_events", "severity_of_harm", "p0", "p1", "poh", "risk_index", "risk_control",
     ]
-    dvp_export_cols = ["verification_id","verification_method","acceptance_criteria","sample_size","test_procedure","requirements","requirement_id"]
+    dvp_export_cols = ["verification_id", "verification_method", "acceptance_criteria", "sample_size", "test_procedure"]
     tm_export_cols = [
-        "verification_id","requirement_id","requirements",
-        "risk_ids","risks_to_health","ha_risk_controls","verification_method","acceptance_criteria",
+        "verification_id", "requirement_id", "requirements",
+        "risk_ids", "risks_to_health", "ha_risk_controls", "verification_method", "acceptance_criteria",
     ]
 
     ha_bytes = df_to_excel_bytes(ha_df[ha_export_cols])
     dvp_bytes = df_to_excel_bytes(dvp_df[dvp_export_cols])
-    tm_bytes  = df_to_excel_bytes(tm_df[tm_export_cols])
+    tm_bytes = df_to_excel_bytes(tm_df[tm_export_cols])
 
-    # Save locally (optional)
+    # Save locally as well (optional / helpful when running locally)
     with open(os.path.join(OUTPUT_DIR, "Hazard_Analysis.xlsx"), "wb") as f:
         f.write(ha_bytes)
     with open(os.path.join(OUTPUT_DIR, "Design_Verification_Protocol.xlsx"), "wb") as f:
@@ -234,48 +263,51 @@ if run_btn:
     with open(os.path.join(OUTPUT_DIR, "Trace_Matrix.xlsx"), "wb") as f:
         f.write(tm_bytes)
 
-    # Build a single ZIP for one-click download
+    # -------- One-click ZIP Download --------
+    st.subheader("Download DHF Package")
     zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("Hazard_Analysis.xlsx", ha_bytes)
         zf.writestr("Design_Verification_Protocol.xlsx", dvp_bytes)
         zf.writestr("Trace_Matrix.xlsx", tm_bytes)
     zip_buf.seek(0)
-    zip_bytes = zip_buf.read()
 
     clicked = st.download_button(
-        "⬇️ Download DHF package (.zip)",
-        data=zip_bytes,
+        "⬇️ Download DHF package (3 Excel files, ZIP)",
+        data=zip_buf.getvalue(),
         file_name="DHF_Package.zip",
         mime="application/zip",
-        type="primary",
+        type="primary"
     )
     if clicked:
         st.success("Hazard Analysis, Design Verification Protocol, Trace Matrix documents downloaded successfully.")
 
-    # -------- Optional: Upload to Google Drive --------
+    # -------- Optional Google Drive upload --------
     if DEFAULT_DRIVE_FOLDER_ID:
-        with st.spinner("Uploading to Google Drive..."):
+        with st.spinner("Uploading files to Google Drive..."):
             drive = init_drive()
             if drive:
                 try:
                     ha_id = drive_upload_bytes(drive, DEFAULT_DRIVE_FOLDER_ID, "Hazard_Analysis.xlsx", ha_bytes)
                     dvp_id = drive_upload_bytes(drive, DEFAULT_DRIVE_FOLDER_ID, "Design_Verification_Protocol.xlsx", dvp_bytes)
-                    tm_id  = drive_upload_bytes(drive, DEFAULT_DRIVE_FOLDER_ID, "Trace_Matrix.xlsx", tm_bytes)
-                    st.info({"Hazard_Analysis.xlsx": ha_id,
-                             "Design_Verification_Protocol.xlsx": dvp_id,
-                             "Trace_Matrix.xlsx": tm_id})
+                    tm_id = drive_upload_bytes(drive, DEFAULT_DRIVE_FOLDER_ID, "Trace_Matrix.xlsx", tm_bytes)
+                    st.info("Uploaded to Google Drive (file IDs shown below).")
+                    st.json({
+                        "Hazard_Analysis.xlsx": ha_id,
+                        "Design_Verification_Protocol.xlsx": dvp_id,
+                        "Trace_Matrix.xlsx": tm_id,
+                    })
                 except Exception as e:
                     st.warning(f"Drive upload failed: {e}")
             else:
-                st.info("Drive not initialized (missing SERVICE_ACCOUNT_JSON secret?). Files saved locally only.")
+                st.info("Drive not initialized (missing SERVICE_ACCOUNT_JSON secret). Files saved locally only.")
 
 st.markdown("---")
 st.markdown(
     f"""
 **Files & Hosting**
-- Outputs saved locally to: `{OUTPUT_DIR}`.
-- Backend: `{BACKEND_URL}` (bearer-auth).
-- Guardrails fill any missing fields with `{TBD}`.
+- Outputs are saved locally to: `{OUTPUT_DIR}` and (optionally) uploaded to your Google Drive folder: `{DEFAULT_DRIVE_FOLDER_ID or '—'}`.
+- Backend is expected at `{BACKEND_URL}` with bearer auth.
+- Guardrails are applied (null/empty/NA ⇒ `{TBD}`).
 """
 )
