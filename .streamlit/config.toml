@@ -8,6 +8,11 @@ enableXsrfProtection = true
 # Optional: explicitly set the port if needed in Spaces
 # port = 7860
 # address = "0.0.0.0"
+[server]
+fileWatcherType = "none"
+headless = true
+runOnSave = false
+
 
 [theme]
 base = "light"
