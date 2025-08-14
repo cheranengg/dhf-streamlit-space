@@ -1,19 +1,11 @@
+# .streamlit/config.toml
+
 [browser]
 gatherUsageStats = false
 
 [server]
-# Increase to handle large Excel inputs in Spaces
-maxUploadSize = 200
-enableXsrfProtection = true
-# Optional: explicitly set the port if needed in Spaces
-# port = 7860
-# address = "0.0.0.0"
-[server]
-fileWatcherType = "none"
+fileWatcherType = "none"    # avoid inotify errors in Spaces
 headless = true
 runOnSave = false
-
-
-[theme]
-base = "light"
-primaryColor = "#2E7D32"
+enableXsrfProtection = true
+maxUploadSize = 200
