@@ -1,10 +1,5 @@
 # app.py — DHF Streamlit UI (Preview + ZIP Download)
 # --------------------------------------------------
-# - Input: Product Requirements (Excel upload OR pasted CSV)
-# - Calls FastAPI backend (HA → DVP → Trace Matrix) with bearer token
-# - Guardrails are ON (missing/empty => "TBD - Human / SME input")
-# - Exports three Excel files zipped into one download
-# - (Optional) uploads the three Excel files to Google Drive if SERVICE_ACCOUNT_JSON + DRIVE_FOLDER_ID are set
 
 import os
 import io
@@ -22,6 +17,14 @@ TBD = "TBD - Human / SME input"
 BACKEND_URL = st.secrets.get("BACKEND_URL", "http://localhost:8080")
 BACKEND_TOKEN = st.secrets.get("BACKEND_TOKEN", "dev-token")
 
+# Row caps (preview + Excel export)
+HA_MAX_ROWS = int(os.getenv("HA_MAX_ROWS", "10"))
+DVP_MAX_ROWS = int(os.getenv("DVP_MAX_ROWS", "10"))
+TM_MAX_ROWS  = int(os.getenv("TM_MAX_ROWS", "10"))
+
+# NEW: cap how many requirements we send to backend
+REQ_MAX = int(os.getenv("REQ_MAX", "10"))
+
 # Optional Google Drive upload
 DEFAULT_DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
 OUTPUT_DIR = st.secrets.get("OUTPUT_DIR", os.path.abspath("./streamlit_outputs"))
@@ -37,7 +40,6 @@ except Exception:
 
 
 def init_drive() -> t.Optional["GoogleDrive"]:
-    """Initialize Google Drive client from SERVICE_ACCOUNT_JSON in secrets."""
     if not _HAS_DRIVE:
         return None
     svc_json = st.secrets.get("SERVICE_ACCOUNT_JSON")
@@ -51,7 +53,6 @@ def init_drive() -> t.Optional["GoogleDrive"]:
     try:
         gauth.LoadServiceAccountCredentials(svc_path)
     except Exception:
-        # fallback for older pydrive2 versions
         gauth.settings.update({
             'client_config_backend': 'service',
             'service_config': {
@@ -65,7 +66,6 @@ def init_drive() -> t.Optional["GoogleDrive"]:
 
 
 def drive_upload_bytes(drive: "GoogleDrive", folder_id: str, filename: str, data: bytes) -> str:
-    """Upload a bytes object to Google Drive and return the file id."""
     file = drive.CreateFile({"title": filename, "parents": [{"id": folder_id}]})
     file.content = io.BytesIO(data)
     file.Upload()
@@ -74,7 +74,6 @@ def drive_upload_bytes(drive: "GoogleDrive", folder_id: str, filename: str, data
 
 # ---------------- Helpers ----------------
 def normalize_requirements(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize uploaded/pasted requirements to three canonical columns."""
     rename_map = {}
     for c in df.columns:
         lc = str(c).strip().lower()
@@ -92,7 +91,6 @@ def normalize_requirements(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    """Serialize a dataframe to Excel bytes (OpenPyXL)."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False)
@@ -101,7 +99,6 @@ def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 
 def basic_guardrails_df(df: pd.DataFrame, required_cols: t.List[str]) -> pd.DataFrame:
-    """Very light guardrail pass to flag missing key fields."""
     issues = []
     for i, row in df.iterrows():
         for c in required_cols:
@@ -112,7 +109,6 @@ def basic_guardrails_df(df: pd.DataFrame, required_cols: t.List[str]) -> pd.Data
 
 
 def fill_tbd(df: pd.DataFrame, cols: t.List[str]) -> pd.DataFrame:
-    """Replace None/empty/NA with our standard TBD token on selected columns."""
     out = df.copy()
     for c in cols:
         if c not in out.columns:
@@ -124,7 +120,6 @@ def fill_tbd(df: pd.DataFrame, cols: t.List[str]) -> pd.DataFrame:
 
 
 def call_backend(endpoint: str, payload: dict) -> dict:
-    """POST a payload to the backend with bearer auth and return JSON."""
     url = f"{BACKEND_URL.rstrip('/')}{endpoint}"
     headers = {"Authorization": f"Bearer {BACKEND_TOKEN}", "Content-Type": "application/json"}
     r = requests.post(url, headers=headers, json=payload, timeout=1200)
@@ -133,10 +128,14 @@ def call_backend(endpoint: str, payload: dict) -> dict:
     return r.json()
 
 
+def head_cap(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    return df.head(n).copy() if isinstance(df, pd.DataFrame) and not df.empty else df
+
+
 # ---------------- UI ----------------
 st.set_page_config(page_title="DHF Automation – Infusion Pump", layout="wide")
 st.title("🧩 DHF Automation – Infusion Pump")
-st.caption("Requirements → Hazard Analysis → DVP → Trace Matrix | Guardrails + Preview | One-click ZIP download")
+st.caption("Requirements → Hazard Analysis → DVP → TM | Guardrails + Preview | One-click ZIP download")
 
 st.markdown("**Provide Product Requirements** (choose one):")
 colA, colB = st.columns(2)
@@ -169,11 +168,17 @@ if run_btn:
 
         req_df = normalize_requirements(req_df)
 
-    st.success(f"Loaded {len(req_df)} requirements.")
-    st.dataframe(req_df.head(20), use_container_width=True)
+    total_reqs = len(req_df)
+    st.success(f"Loaded {total_reqs} requirements.")
+    st.dataframe(head_cap(req_df, 20), use_container_width=True)
+
+    # -------- Limit how many requirements are SENT to backend --------
+    req_df_limited = req_df.head(REQ_MAX).copy()
+    if total_reqs > REQ_MAX:
+        st.info(f"Sending only the first {REQ_MAX} requirements to backend (set REQ_MAX env var to change).")
 
     # -------- Call Backend: HA --------
-    with st.spinner("Running Hazard Analysis (backend)... this can take a while"):
+    with st.spinner("Running Hazard Analysis (backend)..."):
         ha_payload = {
             "requirements": [
                 {
@@ -181,7 +186,7 @@ if run_btn:
                     "Verification ID": r.get("Verification ID"),
                     "Requirements": r.get("Requirements"),
                 }
-                for _, r in req_df.iterrows()
+                for _, r in req_df_limited.iterrows()  # <— limited
             ]
         }
         ha_resp = call_backend("/hazard-analysis", ha_payload)
@@ -195,13 +200,13 @@ if run_btn:
             "harm", "sequence_of_events", "severity_of_harm", "p0", "p1", "poh", "risk_index", "risk_control",
         ],
     )
-    st.subheader("Hazard Analysis (preview)")
-    st.dataframe(ha_df.head(20), use_container_width=True)
+    st.subheader(f"Hazard Analysis (preview, first {HA_MAX_ROWS})")
+    st.dataframe(head_cap(ha_df, HA_MAX_ROWS), use_container_width=True)
 
     # -------- Call Backend: DVP --------
     with st.spinner("Generating Design Verification Protocol (backend)..."):
         dvp_payload = {
-            "requirements": ha_payload["requirements"],
+            "requirements": ha_payload["requirements"],  # already limited
             "ha": ha_rows,
         }
         dvp_resp = call_backend("/dvp", dvp_payload)
@@ -209,18 +214,18 @@ if run_btn:
         dvp_df = pd.DataFrame(dvp_rows)
 
     dvp_df = fill_tbd(dvp_df, ["verification_id", "verification_method", "acceptance_criteria", "sample_size", "test_procedure"])
-    st.subheader("Design Verification Protocol (preview)")
-    st.dataframe(dvp_df.head(20), use_container_width=True)
+    st.subheader(f"Design Verification Protocol (preview, first {DVP_MAX_ROWS})")
+    st.dataframe(head_cap(dvp_df, DVP_MAX_ROWS), use_container_width=True)
 
-    # -------- Call Backend: Trace Matrix --------
+    # -------- Call Backend: TM --------
     with st.spinner("Building Trace Matrix (backend)..."):
         tm_payload = {
-            "requirements": ha_payload["requirements"],
+            "requirements": ha_payload["requirements"],  # already limited
             "ha": ha_rows,
             "dvp": dvp_rows,
         }
-        tm_resp = call_backend("/trace-matrix", tm_payload)
-        tm_rows = tm_resp.get("trace_matrix", [])
+        tm_resp = call_backend("/tm", tm_payload)  # backend returns {"ok":true,"tm":[...]}
+        tm_rows = tm_resp.get("tm", [])
         tm_df = pd.DataFrame(tm_rows)
 
     tm_required_cols = [
@@ -229,10 +234,10 @@ if run_btn:
     ]
     tm_df = fill_tbd(tm_df, tm_required_cols)
 
-    st.subheader("Trace Matrix (preview)")
-    st.dataframe(tm_df.head(20), use_container_width=True)
+    st.subheader(f"Trace Matrix (preview, first {TM_MAX_ROWS})")
+    st.dataframe(head_cap(tm_df, TM_MAX_ROWS), use_container_width=True)
 
-    # -------- Preview-only Guardrails (no editing) --------
+    # -------- Preview-only Guardrails --------
     st.subheader("Human-in-the-Loop (preview only)")
     issues = basic_guardrails_df(tm_df, ["verification_id", "requirement_id", "requirements"])
     if issues is not None and not issues.empty:
@@ -240,7 +245,7 @@ if run_btn:
     else:
         st.success("No guardrail issues detected in the Trace Matrix.")
 
-    # -------- Prepare Exports --------
+    # -------- Prepare Exports (capped) --------
     ha_export_cols = [
         "requirement_id", "risk_id", "risk_to_health", "hazard", "hazardous_situation",
         "harm", "sequence_of_events", "severity_of_harm", "p0", "p1", "poh", "risk_index", "risk_control",
@@ -251,11 +256,11 @@ if run_btn:
         "risk_ids", "risks_to_health", "ha_risk_controls", "verification_method", "acceptance_criteria",
     ]
 
-    ha_bytes = df_to_excel_bytes(ha_df[ha_export_cols])
-    dvp_bytes = df_to_excel_bytes(dvp_df[dvp_export_cols])
-    tm_bytes = df_to_excel_bytes(tm_df[tm_export_cols])
+    ha_bytes = df_to_excel_bytes(head_cap(ha_df[ha_export_cols], HA_MAX_ROWS))
+    dvp_bytes = df_to_excel_bytes(head_cap(dvp_df[dvp_export_cols], DVP_MAX_ROWS))
+    tm_bytes  = df_to_excel_bytes(head_cap(tm_df[tm_export_cols], TM_MAX_ROWS))
 
-    # Save locally as well (optional / helpful when running locally)
+    # Save locally
     with open(os.path.join(OUTPUT_DIR, "Hazard_Analysis.xlsx"), "wb") as f:
         f.write(ha_bytes)
     with open(os.path.join(OUTPUT_DIR, "Design_Verification_Protocol.xlsx"), "wb") as f:
@@ -309,5 +314,7 @@ st.markdown(
 - Outputs are saved locally to: `{OUTPUT_DIR}` and (optionally) uploaded to your Google Drive folder: `{DEFAULT_DRIVE_FOLDER_ID or '—'}`.
 - Backend is expected at `{BACKEND_URL}` with bearer auth.
 - Guardrails are applied (null/empty/NA ⇒ `{TBD}`).
+- Preview and exports are capped to: HA={HA_MAX_ROWS}, DVP={DVP_MAX_ROWS}, TM={TM_MAX_ROWS}.
+- Sending only the first {REQ_MAX} requirements to backend.
 """
 )
