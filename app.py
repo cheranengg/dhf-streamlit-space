@@ -209,9 +209,13 @@ if run_btn:
             "requirements": ha_payload["requirements"],  # already limited
             "ha": ha_rows,
         }
+    try:
         dvp_resp = call_backend("/dvp", dvp_payload)
         dvp_rows = dvp_resp.get("dvp", [])
-        dvp_df = pd.DataFrame(dvp_rows)
+    except Exception as e:
+        st.error(f"DVP backend error: {e}")
+        st.stop()
+    dvp_df = pd.DataFrame(dvp_rows)
 
     dvp_df = fill_tbd(dvp_df, ["verification_id", "verification_method", "acceptance_criteria", "sample_size", "test_procedure"])
     st.subheader(f"Design Verification Protocol (preview, first {DVP_MAX_ROWS})")
@@ -228,18 +232,29 @@ if run_btn:
         tm_rows = tm_resp.get("tm", [])
         tm_df = pd.DataFrame(tm_rows)
 
-    tm_required_cols = [
-        "verification_id", "requirement_id", "requirements",
-        "risk_ids", "risks_to_health", "ha_risk_controls", "verification_method", "acceptance_criteria",
+    # === NEW: exact TM column order & names to match your Excel ===
+    TM_ORDER = [
+        "Requirement ID",
+        "Requirements",
+        "Requirement (Yes/No)",
+        "Risk ID",
+        "Risk to Health",
+        "HA Risk Control",
+        "Verification ID",
+        "Verification Method",
     ]
-    tm_df = fill_tbd(tm_df, tm_required_cols)
+    # Reindex to enforce order; fill missing with TBD/NA as needed
+    tm_df = tm_df.reindex(columns=TM_ORDER)
+    tm_df = fill_tbd(tm_df, TM_ORDER)
 
     st.subheader(f"Trace Matrix (preview, first {TM_MAX_ROWS})")
     st.dataframe(head_cap(tm_df, TM_MAX_ROWS), use_container_width=True)
 
     # -------- Preview-only Guardrails --------
     st.subheader("Human-in-the-Loop (preview only)")
-    issues = basic_guardrails_df(tm_df, ["verification_id", "requirement_id", "requirements"])
+    # Validate critical identity columns present
+    guardrail_required = ["Requirement ID", "Requirements", "Verification ID"]
+    issues = basic_guardrails_df(tm_df, guardrail_required)
     if issues is not None and not issues.empty:
         st.info(f"Guardrails flagged {len(issues)} issue(s). Review the Trace Matrix above before export.")
     else:
@@ -251,10 +266,7 @@ if run_btn:
         "harm", "sequence_of_events", "severity_of_harm", "p0", "p1", "poh", "risk_index", "risk_control",
     ]
     dvp_export_cols = ["verification_id", "verification_method", "acceptance_criteria", "sample_size", "test_procedure"]
-    tm_export_cols = [
-        "verification_id", "requirement_id", "requirements",
-        "risk_ids", "risks_to_health", "ha_risk_controls", "verification_method", "acceptance_criteria",
-    ]
+    tm_export_cols = TM_ORDER[:]  # same order as preview
 
     ha_bytes = df_to_excel_bytes(head_cap(ha_df[ha_export_cols], HA_MAX_ROWS))
     dvp_bytes = df_to_excel_bytes(head_cap(dvp_df[dvp_export_cols], DVP_MAX_ROWS))
