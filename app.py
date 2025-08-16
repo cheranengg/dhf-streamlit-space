@@ -201,7 +201,10 @@ if run_btn:
         ],
     )
     st.subheader(f"Hazard Analysis (preview, first {HA_MAX_ROWS})")
-    st.dataframe(head_cap(ha_df, HA_MAX_ROWS), use_container_width=True)
+    # Hide requirement_id in the table shown to users (it still exists in ha_df for joins)
+    ha_preview = ha_df.drop(columns=["requirement_id"], errors="ignore")
+    st.dataframe(head_cap(ha_preview, HA_MAX_ROWS), use_container_width=True)
+
 
     # -------- Call Backend: DVP --------
     with st.spinner("Generating Design Verification Protocol (backend)..."):
@@ -262,7 +265,7 @@ if run_btn:
 
     # -------- Prepare Exports (capped) --------
     ha_export_cols = [
-        "requirement_id", "risk_id", "risk_to_health", "hazard", "hazardous_situation",
+        "risk_id", "risk_to_health", "hazard", "hazardous_situation",
         "harm", "sequence_of_events", "severity_of_harm", "p0", "p1", "poh", "risk_index", "risk_control",
     ]
     dvp_export_cols = ["verification_id", "verification_method", "acceptance_criteria", "sample_size", "test_procedure"]
