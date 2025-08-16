@@ -18,12 +18,12 @@ BACKEND_URL = st.secrets.get("BACKEND_URL", "http://localhost:8080")
 BACKEND_TOKEN = st.secrets.get("BACKEND_TOKEN", "dev-token")
 
 # Row caps (preview + Excel export)
-HA_MAX_ROWS = int(os.getenv("HA_MAX_ROWS", "5"))
-DVP_MAX_ROWS = int(os.getenv("DVP_MAX_ROWS", "5"))
-TM_MAX_ROWS  = int(os.getenv("TM_MAX_ROWS", "5"))
+HA_MAX_ROWS = int(os.getenv("HA_MAX_ROWS", "50"))
+DVP_MAX_ROWS = int(os.getenv("DVP_MAX_ROWS", "50"))
+TM_MAX_ROWS  = int(os.getenv("TM_MAX_ROWS", "50"))
 
 # NEW: cap how many requirements we send to backend
-REQ_MAX = int(os.getenv("REQ_MAX", "5"))
+REQ_MAX = int(os.getenv("REQ_MAX", "50"))
 
 # Optional Google Drive upload
 DEFAULT_DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
