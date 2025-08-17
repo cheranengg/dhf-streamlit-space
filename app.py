@@ -1,19 +1,24 @@
-# app.py — DHF Streamlit UI
+# app.py — DHF Streamlit UI (Preview + ZIP Download)
 # --------------------------------------------------
+
 import os
 import io
 import json
 import zipfile
 import typing as t
-from pathlib import Path
 
+import numpy as np
 import pandas as pd
-import streamlit as st
 import requests
+import streamlit as st
+
+# Excel styling
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 # ---------------- Constants & Secrets ----------------
 TBD = "TBD - Human / SME input"
-TBD_CANON = {TBD, "NA", "N/A", "NONE", "NULL", ""}
+TBD_CANON = {"", "na", "n/a", "tbd", "none", "null", "nan", "tbd - human / sme input"}
 
 BACKEND_URL = st.secrets.get("BACKEND_URL", "http://localhost:8080")
 BACKEND_TOKEN = st.secrets.get("BACKEND_TOKEN", "dev-token")
@@ -23,34 +28,55 @@ HA_MAX_ROWS = int(os.getenv("HA_MAX_ROWS", "50"))
 DVP_MAX_ROWS = int(os.getenv("DVP_MAX_ROWS", "50"))
 TM_MAX_ROWS  = int(os.getenv("TM_MAX_ROWS", "50"))
 
-# how many requirements to send to backend
+# NEW: cap how many requirements we send to backend
 REQ_MAX = int(os.getenv("REQ_MAX", "50"))
 
-OUTPUT_DIR = os.path.abspath("./streamlit_outputs")
+# Optional Google Drive upload
+DEFAULT_DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
+OUTPUT_DIR = st.secrets.get("OUTPUT_DIR", os.path.abspath("./streamlit_outputs"))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ----------------- Page setup -----------------
-st.set_page_config(page_title="DHF Automation – Infusion Pump", layout="wide")
-left, right = st.columns([0.63, 0.37])
+# ---------------- Optional Google Drive (pydrive2) ----------------
+_HAS_DRIVE = True
+try:
+    from pydrive2.auth import GoogleAuth
+    from pydrive2.drive import GoogleDrive
+except Exception:
+    _HAS_DRIVE = False
 
-with left:
-    st.title("🧩 DHF Automation – Infusion Pump")
-    st.caption("Requirements → Hazard Analysis → DVP → TM")
 
-with right:
-    # show images side-by-side under the title, medium size, no deprecation warnings
-    c1, c2 = st.columns(2, gap="small")
-    assets_dir = Path("app/assets")
-    img1 = str(assets_dir / "Infusion1.jpg")  # microscope
-    img2 = str(assets_dir / "Infusion.jpg")   # infusion pump
-    with c1:
-        if Path(img1).exists():
-            st.image(img1, use_container_width=True)
-    with c2:
-        if Path(img2).exists():
-            st.image(img2, use_container_width=True)
+def init_drive() -> t.Optional["GoogleDrive"]:
+    if not _HAS_DRIVE:
+        return None
+    svc_json = st.secrets.get("SERVICE_ACCOUNT_JSON")
+    if not svc_json:
+        return None
+    os.makedirs(".secrets", exist_ok=True)
+    svc_path = os.path.join(".secrets", "service_account.json")
+    with open(svc_path, "w", encoding="utf-8") as f:
+        f.write(svc_json)
+    gauth = GoogleAuth()
+    try:
+        gauth.LoadServiceAccountCredentials(svc_path)
+    except Exception:
+        gauth.settings.update({
+            'client_config_backend': 'service',
+            'service_config': {
+                'client_json_file_path': svc_path,
+                'client_user_email': json.loads(svc_json).get('client_email', ''),
+            },
+            'oauth_scope': ['https://www.googleapis.com/auth/drive']
+        })
+        gauth.ServiceAuth()
+    return GoogleDrive(gauth)
 
-st.markdown("")
+
+def drive_upload_bytes(drive: "GoogleDrive", folder_id: str, filename: str, data: bytes) -> str:
+    file = drive.CreateFile({"title": filename, "parents": [{"id": folder_id}]})
+    file.content = io.BytesIO(data)
+    file.Upload()
+    return file["id"]
+
 
 # ---------------- Helpers ----------------
 def normalize_requirements(df: pd.DataFrame) -> pd.DataFrame:
@@ -69,6 +95,63 @@ def normalize_requirements(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = None
     return df[["Requirement ID", "Verification ID", "Requirements"]].copy()
 
+
+def df_to_excel_bytes_with_style(
+    df: pd.DataFrame,
+    long_cols: t.Iterable[str] = (),
+    default_col_width: int = 15,
+    long_col_width: int = 100,
+    freeze_pane_addr: str = "D2",
+) -> bytes:
+    """Write df to Excel with formatting."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False)
+        ws = w.book.active
+
+        # Header style
+        header_fill = PatternFill(start_color="C6E0B4", end_color="C6E0B4", fill_type="solid")
+        header_font = Font(bold=True)
+        wrap_align = Alignment(wrap_text=True, vertical="center", horizontal="left")
+
+        # Column widths
+        long_idx = {str(c): i + 1 for i, c in enumerate(df.columns) if str(c) in set(long_cols)}
+        for i, c in enumerate(df.columns, start=1):
+            col_letter = get_column_letter(i)
+            if str(c) in long_idx:
+                ws.column_dimensions[col_letter].width = long_col_width
+            else:
+                ws.column_dimensions[col_letter].width = default_col_width
+
+        # Row height + wrap + header style
+        for r in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+            for cell in r:
+                cell.alignment = wrap_align
+                if cell.row == 1:
+                    cell.fill = header_fill
+                    cell.font = header_font
+            ws.row_dimensions[cell.row].height = 30
+
+        # Freeze panes
+        try:
+            ws.freeze_panes = ws[freeze_pane_addr]
+        except Exception:
+            pass
+
+    buf.seek(0)
+    return buf.read()
+
+
+def basic_guardrails_df(df: pd.DataFrame, required_cols: t.List[str]) -> pd.DataFrame:
+    issues = []
+    for i, row in df.iterrows():
+        for c in required_cols:
+            val = str(row.get(c, "")).strip()
+            if not val or val in {"NA", TBD}:
+                issues.append((i, c, "Missing or TBD"))
+    return pd.DataFrame(issues, columns=["row_index", "column", "issue"]) if issues else pd.DataFrame(columns=["row_index", "column", "issue"])
+
+
 def fill_tbd(df: pd.DataFrame, cols: t.List[str]) -> pd.DataFrame:
     out = df.copy()
     for c in cols:
@@ -76,8 +159,9 @@ def fill_tbd(df: pd.DataFrame, cols: t.List[str]) -> pd.DataFrame:
             out[c] = TBD
         out[c] = out[c].fillna(TBD)
         out.loc[out[c].astype(str).str.strip().eq(""), c] = TBD
-        out.loc[out[c].astype(str).str.upper().isin({"NA","N/A"}), c] = TBD
+        out.loc[out[c].astype(str).str.upper().eq("NA"), c] = TBD
     return out
+
 
 def call_backend(endpoint: str, payload: dict) -> dict:
     url = f"{BACKEND_URL.rstrip('/')}{endpoint}"
@@ -87,125 +171,87 @@ def call_backend(endpoint: str, payload: dict) -> dict:
         raise RuntimeError(f"Backend error {r.status_code}: {r.text[:500]}")
     return r.json()
 
+
 def head_cap(df: pd.DataFrame, n: int) -> pd.DataFrame:
     return df.head(n).copy() if isinstance(df, pd.DataFrame) and not df.empty else df
 
-# ---------- Excel styling ----------
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, PatternFill, Font
-from openpyxl.utils.dataframe import dataframe_to_rows
 
-HEADER_FILL = PatternFill(start_color="C6E0B4", end_color="C6E0B4", fill_type="solid")  # green
-HEADER_FONT = Font(bold=True)
-ALIGN_LEFT_CENTER = Alignment(horizontal="left", vertical="center", wrap_text=True)
+# ---------------- Metrics helpers ----------------
+def pct(n: int, d: int) -> float:
+    return 0.0 if d <= 0 else round(100.0 * n / d, 1)
 
-def _apply_common_sheet_style(ws, col_widths: dict, row_height: int = 30, freeze_cell: str = "D2"):
-    # header style
-    for cell in ws[1]:
-        cell.fill = HEADER_FILL
-        cell.font = HEADER_FONT
-        cell.alignment = ALIGN_LEFT_CENTER
-    # column widths
-    for col_letter, width in col_widths.items():
-        ws.column_dimensions[col_letter].width = width
-    # row heights
-    for r in range(1, ws.max_row + 1):
-        ws.row_dimensions[r].height = row_height
-    # wrap + left align all cells
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
-        for cell in row:
-            cell.alignment = ALIGN_LEFT_CENTER
-    # freeze panes
-    ws.freeze_panes = freeze_cell
-
-def df_to_excel_bytes_styled(df: pd.DataFrame, col_width_map: t.Dict[str, int], freeze_cell: str = "D2") -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Sheet1"
-    for r in dataframe_to_rows(df, index=False, header=True):
-        ws.append(r)
-    # Build address map for widths
-    # Map displayed column letters to desired widths by header name
-    from openpyxl.utils import get_column_letter
-    width_by_letter = {}
-    for idx, col in enumerate(df.columns, start=1):
-        letter = get_column_letter(idx)
-        width_by_letter[letter] = col_width_map.get(col, 15)
-    _apply_common_sheet_style(ws, width_by_letter, row_height=30, freeze_cell=freeze_cell)
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf.read()
-
-# ---------- Metrics ----------
-def _pct(n: int, d: int) -> float:
-    return 0.0 if d <= 0 else round(100.0 * n / max(d, 1), 1)
-
-def _not_tbd_series(s: pd.Series) -> pd.Series:
-    s = s.astype(str).str.strip()
-    return (~s.isin(TBD_CANON)) & s.ne("")
+def _not_tbd_scalar(x) -> bool:
+    s = str(x if x is not None else "").strip()
+    return bool(s) and s.lower() not in TBD_CANON
 
 def ha_metrics(ha_df: pd.DataFrame) -> dict:
     if ha_df is None or ha_df.empty:
         return {}
-    keys = ["risk_to_health","hazard","hazardous_situation","harm",
-            "sequence_of_events","severity_of_harm","p0","p1","poh","risk_index","risk_control"]
-    total_cells = len(ha_df) * len(keys)
-    filled = 0
-    for k in keys:
-        if k in ha_df.columns:
-            filled += int(_not_tbd_series(ha_df[k]).sum())
-    completeness = _pct(filled, total_cells)
-    diversity = _pct(
-        len(
-            ha_df[["risk_to_health","hazard","hazardous_situation","harm"]]
-            .astype(str).drop_duplicates()
-        ),
-        len(ha_df)
+    keys = [
+        "risk_to_health","hazard","hazardous_situation","harm",
+        "sequence_of_events","severity_of_harm","p0","p1","poh","risk_index","risk_control"
+    ]
+    exist_cols = [k for k in keys if k in ha_df.columns]
+    filled = int(
+        ha_df[exist_cols].applymap(_not_tbd_scalar).values.sum()
     )
-    harm_specificity = _pct(
-        int(ha_df["harm"].astype(str).str.len().ge(8).sum()) if "harm" in ha_df.columns else 0,
-        len(ha_df)
-    )
+    completeness = pct(filled, len(ha_df) * len(exist_cols))
+    uniq = ha_df[["risk_to_health","hazard","hazardous_situation","harm"]].drop_duplicates().shape[0] if all(k in ha_df.columns for k in ["risk_to_health","hazard","hazardous_situation","harm"]) else 0
+    diversity = pct(uniq, len(ha_df))
     return {
-        "Completeness": completeness,    # Threshold 90%
-        "Scenario Diversity": diversity,  # Threshold 60%
-        "Harm Specificity": harm_specificity,  # Threshold 70%
+        "Completeness": completeness,   # (Threshold shown in UI)
+        "Scenario Diversity": diversity # (Threshold shown in UI)
     }
+
+def _has_numbers_units(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    return bool(
+        pd.Series([text]).str.contains(r"[±]?\d+(?:\.\d+)?\s?(mA|µA|A|V|kV|ms|s|min|h|mL/h|mL|L|kPa|Pa|%|dB|Ω|°C|g|kg|N|cycles|cm|mm|µL|m)", case=False, regex=True).iloc[0]
+    )
 
 def dvp_metrics(dvp_df: pd.DataFrame) -> dict:
     if dvp_df is None or dvp_df.empty:
         return {}
-    has_meas = dvp_df.get("test_procedure", pd.Series(dtype=str)).astype(str).str.contains(r"\d").sum()
-    proc_quality = _pct(int(has_meas), len(dvp_df))
-    method_coverage = _pct(
-        int(_not_tbd_series(dvp_df.get("verification_method", pd.Series(dtype=str))).sum()),
-        len(dvp_df)
-    )
-    has_accept = _pct(
-        int(_not_tbd_series(dvp_df.get("acceptance_criteria", pd.Series(dtype=str))).sum()),
-        len(dvp_df)
-    )
+    # accept various casings
+    cols = {c.lower(): c for c in dvp_df.columns}
+    vm = cols.get("verification method") or cols.get("verification_method")
+    tp = cols.get("test procedure") or cols.get("test_procedure")
+    ac = cols.get("acceptance criteria") or cols.get("acceptance_criteria")
+    ss = cols.get("sample size") or cols.get("sample_size")
+
+    filled_cols = [c for c in [vm, tp, ac, ss] if c]
+    filled = int(dvp_df[filled_cols].applymap(_not_tbd_scalar).values.sum())
+    completeness = pct(filled, len(dvp_df) * len(filled_cols)) if filled_cols else 0.0
+
+    measurable = int(dvp_df[tp].apply(_has_numbers_units).sum()) if tp else 0
+    meas_pct = pct(measurable, len(dvp_df))
     return {
-        "Procedure Quality": proc_quality,        # Threshold 70%
-        "Method Coverage": method_coverage,       # Threshold 90%
-        "Acceptance Coverage": has_accept,        # Threshold 95%
+        "DVP Field Completeness": completeness, # threshold in UI
+        "Measurable Test Steps": meas_pct       # threshold in UI
     }
+
+def _token_overlap(a: str, b: str) -> float:
+    def toks(x):
+        return {t.lower() for t in (x or "").split() if t.isalpha() and len(t) >= 4}
+    aa, bb = toks(a), toks(b)
+    if not aa or not bb:
+        return 0.0
+    inter = len(aa & bb)
+    denom = max(1, min(len(aa), len(bb)))
+    return inter / denom
 
 def tm_metrics(tm_df: pd.DataFrame) -> dict:
     if tm_df is None or tm_df.empty:
         return {}
-    # risk control ↔ requirement mapping %
-    rc = tm_df.get("HA Risk Control", tm_df.get("ha_risk_controls", pd.Series(dtype=str))).astype(str)
-    req = tm_df.get("Requirements", tm_df.get("requirements", pd.Series(dtype=str))).astype(str)
-    mapped = (rc.str.len().ge(6) & req.str.len().ge(6)).sum()
-    mapping = _pct(int(mapped), len(tm_df))
-    # coverage (Verification ID present)
-    coverage = _pct(int(_not_tbd_series(tm_df.get("Verification ID", tm_df.get("verification_id", pd.Series(dtype=str)))).sum()), len(tm_df))
-    return {
-        "Risk-Control Mapping": mapping,  # Threshold 80%
-        "Verification Coverage": coverage # Threshold 95%
-    }
+    # names from our TM schema
+    req = "Requirements"
+    rc  = "HA Risk Control"
+    ok = tm_df[[req, rc]].apply(
+        lambda r: _token_overlap(str(r[req]), str(r[rc])) >= 0.2, axis=1
+    ).sum()
+    mapping = pct(int(ok), len(tm_df))
+    return {"Req↔RiskControl Mapping": mapping}  # threshold shown in UI
 
 def render_metrics(ha_df, dvp_df, tm_df):
     ha = ha_metrics(ha_df)
@@ -213,50 +259,67 @@ def render_metrics(ha_df, dvp_df, tm_df):
     tm  = tm_metrics(tm_df)
 
     st.subheader("Evaluation Metrics")
-    st.caption("Objective: quick, data-driven checks to highlight completeness and consistency of the generated DHF artifacts.")
+    st.caption("Objective: these metrics quickly summarize coverage, consistency, and requirement↔control mapping quality across the generated documents.")
+
+    # display with thresholds
+    T = {
+        "HA": {
+            "Completeness": 80,
+            "Scenario Diversity": 40,
+        },
+        "DVP": {
+            "DVP Field Completeness": 80,
+            "Measurable Test Steps": 60,
+        },
+        "TM": {
+            "Req↔RiskControl Mapping": 60,
+        }
+    }
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(f"HA • Completeness (Threshold: {T['HA']['Completeness']}%)", f"{ha.get('Completeness',0)}%")
+        st.metric(f"HA • Scenario Diversity (Threshold: {T['HA']['Scenario Diversity']}%)", f"{ha.get('Scenario Diversity',0)}%")
+    with col2:
+        st.metric(f"DVP • Field Completeness (Threshold: {T['DVP']['DVP Field Completeness']}%)", f"{dvp.get('DVP Field Completeness',0)}%")
+        st.metric(f"DVP • Measurable Steps (Threshold: {T['DVP']['Measurable Test Steps']}%)", f"{dvp.get('Measurable Test Steps',0)}%")
+    with col3:
+        st.metric(f"TM • Req↔RiskControl Mapping (Threshold: {T['TM']['Req↔RiskControl Mapping']}%)", f"{tm.get('Req↔RiskControl Mapping',0)}%")
+
     st.caption("Please involve Medical Device SMEs for final review of these documents before approval.")
 
-    def line(label, val, thr):
-        st.write(f"- **{label}**: {val:.1f}%  _(Threshold: {thr}%)_")
 
-    colA, colB, colC = st.columns(3)
-    with colA:
-        st.markdown("**Hazard Analysis**")
-        if ha: 
-            line("Completeness", ha["Completeness"], 90)
-            line("Scenario Diversity", ha["Scenario Diversity"], 60)
-            line("Harm Specificity", ha["Harm Specificity"], 70)
-        else:
-            st.write("_No rows_")
+# ---------------- UI ----------------
+st.set_page_config(page_title="DHF Automation – Infusion Pump", layout="wide")
 
-    with colB:
-        st.markdown("**Design Verification Protocol**")
-        if dvp:
-            line("Procedure Quality", dvp["Procedure Quality"], 70)
-            line("Method Coverage", dvp["Method Coverage"], 90)
-            line("Acceptance Coverage", dvp["Acceptance Coverage"], 95)
-        else:
-            st.write("_No rows_")
+# Title (single line) + images on the right
+top_cols = st.columns([0.70, 0.30])
+with top_cols[0]:
+    st.markdown(
+        "<h1 style='margin-top:0; white-space:nowrap;'>DHF Automation – Infusion Pump</h1>",
+        unsafe_allow_html=True
+    )
+    st.markdown("Requirements → Hazard Analysis → DVP → TM")
 
-    with colC:
-        st.markdown("**Trace Matrix**")
-        if tm:
-            line("Risk-Control Mapping", tm["Risk-Control Mapping"], 80)
-            line("Verification Coverage", tm["Verification Coverage"], 95)
-        else:
-            st.write("_No rows_")
+with top_cols[1]:
+    c1, c2 = st.columns(2)
+    with c1:
+        st.image("streamlit_assets/Infusion1.jpg", use_container_width=True)
+    with c2:
+        st.image("streamlit_assets/Infusion.jpg", use_container_width=True)
 
-# ---------------- Inputs (top, single button) ----------------
+st.divider()
+
 st.markdown("**Provide Product Requirements** (choose one):")
-topA, topB = st.columns([0.55, 0.45])
-
-with topA:
+colA, colB = st.columns(2)
+with colA:
     uploaded = st.file_uploader("Upload Product Requirements (Excel .xlsx)", type=["xlsx", "xls"])
-with topB:
+with colB:
     sample = "Requirement ID,Verification ID,Requirements\nPR-001,VER-001,System shall ..."
-    pasted = st.text_area("Paste as CSV (with headers)", value="", height=120, placeholder=sample)
+    pasted = st.text_area("Paste as CSV (with headers)", value="", height=140, placeholder=sample)
 
-run_btn = st.button("▶️ Generate DHF Packages", type="primary")
+# One button only (kept near the top)
+run_btn = st.button("▶️ Generate DHF Packages", type="primary", use_container_width=False)
 
 if run_btn:
     # -------- Parse Requirements --------
@@ -297,14 +360,10 @@ if run_btn:
                     "Verification ID": r.get("Verification ID"),
                     "Requirements": r.get("Requirements"),
                 }
-                for _, r in req_df_limited.iterrows()
+                for _, r in req_df_limited.iterrows()  # <— limited
             ]
         }
-        try:
-            ha_resp = call_backend("/hazard-analysis", ha_payload)
-        except Exception as e:
-            st.error(f"HA backend error: {e}")
-            st.stop()
+        ha_resp = call_backend("/hazard-analysis", ha_payload)
         ha_rows = ha_resp.get("ha", [])
         ha_df = pd.DataFrame(ha_rows)
 
@@ -312,8 +371,7 @@ if run_btn:
         ha_df,
         [
             "risk_id", "risk_to_health", "hazard", "hazardous_situation",
-            "harm", "sequence_of_events", "severity_of_harm",
-            "p0", "p1", "poh", "risk_index", "risk_control",
+            "harm", "sequence_of_events", "severity_of_harm", "p0", "p1", "poh", "risk_index", "risk_control",
         ],
     )
     st.subheader(f"Hazard Analysis (preview, first {HA_MAX_ROWS})")
@@ -322,40 +380,50 @@ if run_btn:
     # -------- Call Backend: DVP --------
     with st.spinner("Generating Design Verification Protocol (backend)..."):
         dvp_payload = {
-            "requirements": ha_payload["requirements"],  # limited
+            "requirements": ha_payload["requirements"],  # already limited
             "ha": ha_rows,
         }
-        try:
-            dvp_resp = call_backend("/dvp", dvp_payload)
-            dvp_rows = dvp_resp.get("dvp", [])
-        except Exception as e:
-            st.error(f"DVP backend error: {e}")
-            st.stop()
+    try:
+        dvp_resp = call_backend("/dvp", dvp_payload)
+        dvp_rows = dvp_resp.get("dvp", [])
+    except Exception as e:
+        st.error(f"DVP backend error: {e}")
+        st.stop()
     dvp_df = pd.DataFrame(dvp_rows)
-    dvp_df = fill_tbd(dvp_df, [
-        "verification_id","requirement_id","requirements",
-        "verification_method","sample_size","test_procedure","acceptance_criteria"
-    ])
+
+    # Standardize names to match export schema
+    rename_map = {
+        "verification_id": "Verification ID",
+        "requirement_id": "Requirement ID",
+        "requirements": "Requirements",
+        "verification_method": "Verification Method",
+        "sample_size": "Sample size",
+        "test_procedure": "Test Procedure",
+        "acceptance_criteria": "Acceptance criteria",
+    }
+    dvp_df = dvp_df.rename(columns=rename_map)
+    dvp_order = [
+        "Verification ID", "Requirement ID", "Requirements",
+        "Verification Method", "Sample size", "Test Procedure", "Acceptance criteria"
+    ]
+    dvp_df = dvp_df.reindex(columns=dvp_order)
+    dvp_df = fill_tbd(dvp_df, dvp_order)
+
     st.subheader(f"Design Verification Protocol (preview, first {DVP_MAX_ROWS})")
     st.dataframe(head_cap(dvp_df, DVP_MAX_ROWS), use_container_width=True)
 
     # -------- Call Backend: TM --------
     with st.spinner("Building Trace Matrix (backend)..."):
         tm_payload = {
-            "requirements": ha_payload["requirements"],
+            "requirements": ha_payload["requirements"],  # already limited
             "ha": ha_rows,
             "dvp": dvp_rows,
         }
-        try:
-            tm_resp = call_backend("/tm", tm_payload)  # backend returns {"ok":true,"tm":[...]}
-            tm_rows = tm_resp.get("tm", [])
-        except Exception as e:
-            st.error(f"TM backend error: {e}")
-            st.stop()
+        tm_resp = call_backend("/tm", tm_payload)  # backend returns {"ok":true,"tm":[...]}
+        tm_rows = tm_resp.get("tm", [])
+        tm_df = pd.DataFrame(tm_rows)
 
-    tm_df = pd.DataFrame(tm_rows)
-
-    # Exact TM column order & names for preview/export
+    # Enforce exact TM column order
     TM_ORDER = [
         "Requirement ID",
         "Requirements",
@@ -366,17 +434,6 @@ if run_btn:
         "Verification ID",
         "Verification Method",
     ]
-    # If backend uses snake_case, rename to Title Case
-    tm_df = tm_df.rename(columns={
-        "requirement_id": "Requirement ID",
-        "requirements": "Requirements",
-        "Requirement (Yes/No)": "Requirement (Yes/No)",
-        "risk_ids": "Risk ID",
-        "risks_to_health": "Risk to Health",
-        "ha_risk_controls": "HA Risk Control",
-        "verification_id": "Verification ID",
-        "verification_method": "Verification Method",
-    })
     tm_df = tm_df.reindex(columns=TM_ORDER)
     tm_df = fill_tbd(tm_df, TM_ORDER)
 
@@ -387,49 +444,37 @@ if run_btn:
     render_metrics(ha_df, dvp_df, tm_df)
 
     # -------- Prepare styled Excel exports (capped for preview) --------
-    # HA export
     ha_export_cols = [
         "risk_id", "risk_to_health", "hazard", "hazardous_situation",
         "harm", "sequence_of_events", "severity_of_harm", "p0", "p1", "poh", "risk_index", "risk_control",
     ]
-    ha_x = head_cap(ha_df[ha_export_cols], HA_MAX_ROWS).copy()
-    # Column widths: 15 each except Risk Control = 100
-    ha_widths = {c: 15 for c in ha_x.columns}
-    if "risk_control" in ha_x.columns:
-        ha_widths["risk_control"] = 100
-    ha_bytes = df_to_excel_bytes_styled(ha_x, ha_widths, freeze_cell="D2")
+    # Use only intersecting columns to avoid KeyErrors
+    ha_export_cols = [c for c in ha_export_cols if c in ha_df.columns]
+    ha_bytes = df_to_excel_bytes_with_style(
+        head_cap(ha_df[ha_export_cols], HA_MAX_ROWS),
+        long_cols=["risk_control"],
+        long_col_width=100,
+        default_col_width=15,
+        freeze_pane_addr="D2"
+    )
 
-    # DVP export (order + titles like your screenshot)
-    dvp_x = head_cap(dvp_df, DVP_MAX_ROWS).copy().rename(columns={
-        "verification_id": "Verification ID",
-        "requirement_id": "Requirement ID",
-        "requirements": "Requirements",
-        "verification_method": "Verification Method",
-        "sample_size": "Sample size",
-        "test_procedure": "Test Procedure",
-        "acceptance_criteria": "Acceptance criteria",
-    })
-    dvp_order = [
-        "Verification ID","Requirement ID","Requirements",
-        "Verification Method","Sample size","Test Procedure","Acceptance criteria"
-    ]
-    dvp_x = dvp_x.reindex(columns=dvp_order)
-    # Widths: 15 for all except Acceptance criteria & Test Procedure = 100
-    dvp_widths = {c: 15 for c in dvp_order}
-    dvp_widths["Acceptance criteria"] = 100
-    dvp_widths["Test Procedure"] = 100
-    dvp_bytes = df_to_excel_bytes_styled(dvp_x, dvp_widths, freeze_cell="D2")
+    dvp_bytes = df_to_excel_bytes_with_style(
+        head_cap(dvp_df, DVP_MAX_ROWS),
+        long_cols=["Acceptance criteria", "Test Procedure"],
+        long_col_width=100,
+        default_col_width=15,
+        freeze_pane_addr="D2"
+    )
 
-    # TM export (order already set). Set Requirements & HA Risk Control = 100
-    tm_x = head_cap(tm_df, TM_MAX_ROWS).copy()
-    tm_widths = {c: 15 for c in tm_x.columns}
-    if "Requirements" in tm_x.columns:
-        tm_widths["Requirements"] = 100
-    if "HA Risk Control" in tm_x.columns:
-        tm_widths["HA Risk Control"] = 100
-    tm_bytes  = df_to_excel_bytes_styled(tm_x, tm_widths, freeze_cell="D2")
+    tm_bytes  = df_to_excel_bytes_with_style(
+        head_cap(tm_df, TM_MAX_ROWS),
+        long_cols=["Requirements", "HA Risk Control"],
+        long_col_width=100,
+        default_col_width=15,
+        freeze_pane_addr="D2"
+    )
 
-    # Save locally (optional)
+    # Save locally
     with open(os.path.join(OUTPUT_DIR, "Hazard_Analysis.xlsx"), "wb") as f:
         f.write(ha_bytes)
     with open(os.path.join(OUTPUT_DIR, "Design_Verification_Protocol.xlsx"), "wb") as f:
@@ -454,5 +499,25 @@ if run_btn:
         type="primary"
     )
     if clicked:
-        st.success("DHF documents downloaded successfully — Hazard Analysis, Design Verification Protocol, Trace Matrix.")
-        st.info("Note: Please involve Medical Device SMEs for final review of these documents before approval.")
+        st.success("DHF documents downloaded successfully - Hazard Analysis, Design Verification Protocol, Trace Matrix")
+        st.info("Note: Please involve Medical Device - SME reviews, before final approval.")
+
+    # -------- Optional Google Drive upload --------
+    if DEFAULT_DRIVE_FOLDER_ID:
+        with st.spinner("Uploading files to Google Drive..."):
+            drive = init_drive()
+            if drive:
+                try:
+                    ha_id = drive_upload_bytes(drive, DEFAULT_DRIVE_FOLDER_ID, "Hazard_Analysis.xlsx", ha_bytes)
+                    dvp_id = drive_upload_bytes(drive, DEFAULT_DRIVE_FOLDER_ID, "Design_Verification_Protocol.xlsx", dvp_bytes)
+                    tm_id = drive_upload_bytes(drive, DEFAULT_DRIVE_FOLDER_ID, "Trace_Matrix.xlsx", tm_bytes)
+                    st.info("Uploaded to Google Drive (file IDs shown below).")
+                    st.json({
+                        "Hazard_Analysis.xlsx": ha_id,
+                        "Design_Verification_Protocol.xlsx": dvp_id,
+                        "Trace_Matrix.xlsx": tm_id,
+                    })
+                except Exception as e:
+                    st.warning(f"Drive upload failed: {e}")
+            else:
+                st.info("Drive not initialized (missing SERVICE_ACCOUNT_JSON secret). Files saved locally only.")
