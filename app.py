@@ -1,4 +1,4 @@
-# app.py — DHF Streamlit UI (Preview + ZIP Download) with metric thresholds
+# app.py — DHF Streamlit UI (Preview + ZIP Download) with metric thresholds + bugfixes
 
 import os
 import io
@@ -27,15 +27,14 @@ REQ_MAX = int(os.getenv("REQ_MAX", "50"))
 
 # Assets (images)
 ASSET_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "streamlit_assets"))
-INFUSION_IMG  = os.path.join(ASSET_DIR, "Infusion.jpg")
-INFUSION_IMG1 = os.path.join(ASSET_DIR, "Infusion1.jpg")
+INFUSION_IMG  = os.path.join(ASSET_DIR, "Infusion.jpg")   # right image in row
+INFUSION_IMG1 = os.path.join(ASSET_DIR, "Infusion1.jpg")  # left image in row
 
 # Output dir (optional local save area)
 OUTPUT_DIR = st.secrets.get("OUTPUT_DIR", os.path.abspath("./streamlit_outputs"))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ---------------- Thresholds ----------------
-# Tweak these anytime; they render as "(Threshold: xx%)" and drive the delta coloring.
 THRESHOLDS = {
     "HA": {
         "Completeness": 80,
@@ -99,17 +98,10 @@ def fill_tbd(df: pd.DataFrame, cols: t.List[str]) -> pd.DataFrame:
 
 # ---------------- Styled Excel writer ----------------
 def styled_excel_bytes(df: pd.DataFrame, col_widths: dict, freeze_cell: str = "D2",
-                       wrap=True, header_fill="00C6F6D5",  # soft green
+                       wrap=True, header_fill="00C6F6D5",
                        all_cols_default_width=15, row_height=30,
                        align="left", valign="center") -> bytes:
-    """
-    One-sheet Excel file with formatting:
-      - column widths (override via col_widths)
-      - row height
-      - wrap text
-      - header bold + fill
-      - freeze panes at `freeze_cell`
-    """
+    """Single-sheet Excel with formatting."""
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
     from openpyxl import Workbook
@@ -118,31 +110,27 @@ def styled_excel_bytes(df: pd.DataFrame, col_widths: dict, freeze_cell: str = "D
     ws = wb.active
     ws.title = "Sheet1"
 
-    # Write header + data
+    # data
     ws.append(list(df.columns))
     for _, row in df.iterrows():
         ws.append(list(row.values))
 
-    # Header style
+    # header style
     header_font = Font(bold=True)
     header_fill = PatternFill("solid", fgColor=header_fill)
     for cell in ws[1]:
         cell.font = header_font
         cell.fill = header_fill
 
-    # Freeze
-    ws.freeze_panes = freeze_cell  # "D2" => freeze top row + first 3 cols
+    ws.freeze_panes = freeze_cell
 
-    # Column widths + alignment + wrapping
     alignment = Alignment(horizontal=align, vertical=valign, wrap_text=bool(wrap))
     for col_idx, col_name in enumerate(df.columns, start=1):
         width = col_widths.get(col_name, all_cols_default_width)
         ws.column_dimensions[get_column_letter(col_idx)].width = width
-        for r in range(1, len(df) + 2):  # include header row
-            cell = ws.cell(row=r, column=col_idx)
-            cell.alignment = alignment
+        for r in range(1, len(df) + 2):
+            ws.cell(row=r, column=col_idx).alignment = alignment
 
-    # Row heights
     for r in range(1, len(df) + 2):
         ws.row_dimensions[r].height = row_height
 
@@ -169,7 +157,7 @@ def pct(n, d):
     return 0 if d <= 0 else round(100.0 * n / d, 1)
 
 def _not_tbd(x) -> bool:
-    s = str(x or "").strip()
+    s = str(x if x is not None else "").strip()
     return bool(s) and s not in TBD_CANON
 
 def _has_numbers_units(text: str) -> bool:
@@ -190,16 +178,29 @@ def _tokens(s: str) -> set:
 def ha_metrics(ha_df: pd.DataFrame) -> dict:
     if ha_df is None or ha_df.empty:
         return {}
-    keys = ["risk_to_health", "hazard", "hazardous_situation", "harm", "risk_control",
-            "sequence_of_events", "severity_of_harm", "p0", "p1", "poh", "risk_index"]
-    filled = sum(_not_tbd(ha_df.get(k, "")) for k in keys for _ in ha_df.index)
-    completeness = pct(filled, len(ha_df) * len(keys))
+    # count non-TBD for each relevant column, then sum
+    keys = ["risk_to_health", "hazard", "hazardous_situation", "harm",
+            "risk_control", "sequence_of_events", "severity_of_harm",
+            "p0", "p1", "poh", "risk_index"]
+    filled = 0
+    total_slots = len(ha_df) * len(keys)
+    for k in keys:
+        if k in ha_df.columns:
+            filled += ha_df[k].apply(_not_tbd).sum()
+    completeness = pct(filled, total_slots)
+
     uniq = ha_df[["risk_to_health", "hazard", "hazardous_situation", "harm"]].drop_duplicates().shape[0]
     diversity = pct(uniq, len(ha_df))
-    sev_ok = ha_df["severity_of_harm"].astype(str).str.fullmatch(r"[1-5]").sum()
+
+    if "severity_of_harm" in ha_df.columns:
+        sev_ok = ha_df["severity_of_harm"].astype(str).str.fullmatch(r"[1-5]").sum()
+    else:
+        sev_ok = 0
     sev_cov = pct(sev_ok, len(ha_df))
-    ctrl_spec = ha_df["risk_control"].apply(_is_specific).sum()
+
+    ctrl_spec = ha_df["risk_control"].apply(_is_specific).sum() if "risk_control" in ha_df.columns else 0
     ctrl_score = pct(ctrl_spec, len(ha_df))
+
     return {
         "Completeness": completeness,
         "Diversity": diversity,
@@ -210,9 +211,9 @@ def ha_metrics(ha_df: pd.DataFrame) -> dict:
 def dvp_metrics(dvp_df: pd.DataFrame) -> dict:
     if dvp_df is None or dvp_df.empty:
         return {}
-    proc_score = pct(dvp_df["test_procedure"].apply(_has_numbers_units).sum(), len(dvp_df))
-    ac_score   = pct(dvp_df["acceptance_criteria"].apply(_has_numbers_units).sum(), len(dvp_df))
-    method_ok  = pct(dvp_df["verification_method"].apply(_not_tbd).sum(), len(dvp_df))
+    proc_score = pct(dvp_df["test_procedure"].apply(_has_numbers_units).sum(), len(dvp_df)) if "test_procedure" in dvp_df else 0
+    ac_score   = pct(dvp_df["acceptance_criteria"].apply(_has_numbers_units).sum(), len(dvp_df)) if "acceptance_criteria" in dvp_df else 0
+    method_ok  = pct(dvp_df["verification_method"].apply(_not_tbd).sum(), len(dvp_df)) if "verification_method" in dvp_df else 0
     return {
         "Measurable procedures": proc_score,
         "Acceptance measurability": ac_score,
@@ -230,14 +231,16 @@ def _overlap_ratio(a: str, b: str) -> float:
 def tm_metrics(tm_df: pd.DataFrame) -> dict:
     if tm_df is None or tm_df.empty:
         return {}
-    # Linkage rate (Verification ID present)
-    link_score = pct(tm_df["Verification ID"].apply(_not_tbd).sum(), len(tm_df))
-    # Column coverage
+    link_score = pct(tm_df.get("Verification ID", pd.Series([])).apply(_not_tbd).sum(), len(tm_df))
+
     tm_cols = ["Requirement ID","Requirements","Requirement (Yes/No)","Risk ID",
                "Risk to Health","HA Risk Control","Verification ID","Verification Method"]
-    cov = sum(_not_tbd(tm_df.get(c, "")) for c in tm_cols for _ in tm_df.index)
+    cov = 0
+    for c in tm_cols:
+        if c in tm_df.columns:
+            cov += tm_df[c].apply(_not_tbd).sum()
     coverage = pct(cov, len(tm_df) * len(tm_cols))
-    # Mapping % between Requirements and HA Risk Control (token overlap > 0.12)
+
     overlaps = 0
     total_considered = 0
     for _, row in tm_df.iterrows():
@@ -262,37 +265,32 @@ def _metric_block(col, title, metrics: dict, thresholds: dict):
         label = f"{k}  (Threshold: {thr}%)"
         col.metric(label, f"{v}%", delta=f"{delta_val}%")
 
-
 def render_metrics(ha_df, dvp_df, tm_df):
     ha = ha_metrics(ha_df)
     dvp = dvp_metrics(dvp_df)
     tm  = tm_metrics(tm_df)
     st.subheader("Evaluation Metrics")
-
     col1, col2, col3 = st.columns(3)
     _metric_block(col1, "Hazard Analysis", ha, THRESHOLDS["HA"])
     _metric_block(col2, "Design Verification Protocol", dvp, THRESHOLDS["DVP"])
     _metric_block(col3, "Trace Matrix", tm, THRESHOLDS["TM"])
-
     st.caption(
-        "Notes: Scores are auto-computed from generated tables (completeness, measurability, linkage, and mapping). "
-        "They do not substitute clinical correctness — please involve Medical Device SMEs for review."
+        "Notes: Scores are computed from generated tables (completeness, measurability, linkage, mapping). "
+        "They support review but do not replace SME validation."
     )
-
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="DHF Automation – Infusion Pump", layout="wide")
 st.title("🧩 DHF Automation – Infusion Pump")
 st.caption("Requirements → Hazard Analysis → DVP → TM")
 
-# Images on the right side
-right = st.columns([2, 1])[1]
-with right:
-    c1, c2 = st.columns(2, gap="medium")
+# Put the two images directly under the title (no side column so the button stays visible)
+if os.path.exists(INFUSION_IMG1) or os.path.exists(INFUSION_IMG):
+    imgc1, imgc2, spacer = st.columns([1,1,2], gap="large")
     if os.path.exists(INFUSION_IMG1):
-        c1.image(INFUSION_IMG1, use_container_width=True)
+        imgc1.image(INFUSION_IMG1, use_container_width=True)
     if os.path.exists(INFUSION_IMG):
-        c2.image(INFUSION_IMG, use_container_width=True)
+        imgc2.image(INFUSION_IMG, use_container_width=True)
 
 st.markdown("**Provide Product Requirements** (choose one):")
 colA, colB = st.columns(2)
@@ -302,6 +300,7 @@ with colB:
     sample = "Requirement ID,Verification ID,Requirements\nPR-001,VER-001,System shall ..."
     pasted = st.text_area("Paste as CSV (with headers)", value="", height=140, placeholder=sample)
 
+# Keep the button near the input area so users don't need to scroll to find it.
 run_btn = st.button("✅ Generate DHF Packages", type="primary")
 
 if run_btn:
@@ -390,7 +389,6 @@ if run_btn:
         tm_rows = tm_resp.get("tm", [])
         tm_df = pd.DataFrame(tm_rows)
 
-    # Exact TM column order & names (as in your Excel)
     TM_ORDER = [
         "Requirement ID",
         "Requirements",
@@ -410,7 +408,7 @@ if run_btn:
     # -------- Evaluation Metrics (with thresholds) --------
     render_metrics(ha_df, dvp_df, tm_df)
 
-    # -------- Prepare styled Excel exports (capped for preview) --------
+    # -------- Prepare styled Excel exports --------
     ha_export_cols = [
         "risk_id", "risk_to_health", "hazard", "hazardous_situation",
         "harm", "sequence_of_events", "severity_of_harm", "p0", "p1", "poh",
@@ -423,7 +421,6 @@ if run_btn:
     dvp_x = head_cap(dvp_df[dvp_export_cols], DVP_MAX_ROWS)
     tm_x  = head_cap(tm_df[tm_export_cols], TM_MAX_ROWS)
 
-    # Styling per your spec
     ha_bytes = styled_excel_bytes(
         ha_x,
         col_widths={**{c:15 for c in ha_export_cols}, "risk_control":100},
@@ -440,7 +437,7 @@ if run_btn:
         freeze_cell="D2"
     )
 
-    # Save locally (optional)
+    # Save locally
     with open(os.path.join(OUTPUT_DIR, "Hazard_Analysis.xlsx"), "wb") as f:
         f.write(ha_bytes)
     with open(os.path.join(OUTPUT_DIR, "Design_Verification_Protocol.xlsx"), "wb") as f:
