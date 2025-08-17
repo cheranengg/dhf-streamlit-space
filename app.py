@@ -1,5 +1,5 @@
-# app.py — DHF Streamlit UI (Preview + ZIP Download)
-# --------------------------------------------------
+# app.py — DHF Streamlit UI 
+# -------------------------
 
 import os
 import io
@@ -11,7 +11,6 @@ import pandas as pd
 import streamlit as st
 import requests
 
-# ---------------- Constants & Secrets ----------------
 TBD = "TBD - Human / SME input"
 TBD_CANON = {TBD, "TBD", "NA", "N/A", "None", "null", ""}
 
@@ -23,15 +22,13 @@ HA_MAX_ROWS = int(os.getenv("HA_MAX_ROWS", "50"))
 DVP_MAX_ROWS = int(os.getenv("DVP_MAX_ROWS", "50"))
 TM_MAX_ROWS  = int(os.getenv("TM_MAX_ROWS", "50"))
 
-# NEW: cap how many requirements we send to backend
 REQ_MAX = int(os.getenv("REQ_MAX", "50"))
 
-# Optional Google Drive upload (left wired but unused)
+# Optional Google Drive upload 
 DEFAULT_DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
 OUTPUT_DIR = st.secrets.get("OUTPUT_DIR", os.path.abspath("./streamlit_outputs"))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ---------------- Optional Google Drive (pydrive2) ----------------
 _HAS_DRIVE = True
 try:
     from pydrive2.auth import GoogleAuth
@@ -72,8 +69,6 @@ def drive_upload_bytes(drive: "GoogleDrive", folder_id: str, filename: str, data
     file.Upload()
     return file["id"]
 
-
-# ---------------- Helpers ----------------
 def normalize_requirements(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {}
     for c in df.columns:
@@ -247,7 +242,7 @@ def render_metrics(ha_df: pd.DataFrame, dvp_df: pd.DataFrame, tm_df: pd.DataFram
             unsafe_allow_html=True,
         )
 
-    # Row 2: HA Diversity • DVP Alignment • TM Requirement Coverage (NEW)
+    # Row 2 - HA Diversity • DVP Alignment • TM Requirement Coverage (NEW)
     c4, c5, c6 = st.columns(3)
     with c4:
         st.markdown(
@@ -276,7 +271,7 @@ def render_metrics(ha_df: pd.DataFrame, dvp_df: pd.DataFrame, tm_df: pd.DataFram
     )
 
 
-# ---------------- Excel styling helpers ----------------
+# ---------------- Excel styling ----------------
 def style_common(ws):
     from openpyxl.styles import Alignment, Font, PatternFill
     # Header row
@@ -498,7 +493,7 @@ if run_btn:
     # -------- Evaluation Metrics (with thresholds) --------
     render_metrics(ha_df, dvp_df, tm_df)
 
-    # -------- Prepare styled Excel exports (capped for preview) --------
+    # -------- Prepare styled Excel exports --------
     ha_export_cols = [
         "requirement_id", "risk_id", "risk_to_health", "hazard", "hazardous_situation",
         "harm", "sequence_of_events", "severity_of_harm", "p0", "p1", "poh", "risk_index", "risk_control",
