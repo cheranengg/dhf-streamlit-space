@@ -26,10 +26,23 @@ TM_MAX_ROWS  = int(os.getenv("TM_MAX_ROWS", "50"))
 # Send at most this many requirements to backend
 REQ_MAX = int(os.getenv("REQ_MAX", "50"))
 
-# Assets (hero images near the title)
-ASSETS_DIR = Path("app/assets")
-IMG1 = ASSETS_DIR / "Infusion1.jpg"   # microscope
-IMG2 = ASSETS_DIR / "Infusion.jpg"    # infusion pump
+# ---------- Asset resolution (look in streamlit_assets first) ----------
+CANDIDATE_ASSET_DIRS = [
+    Path("streamlit_assets"),
+    Path("app/assets"),
+    Path("assets"),
+    Path("."),
+]
+
+def find_asset(name: str) -> t.Optional[Path]:
+    for base in CANDIDATE_ASSET_DIRS:
+        p = base / name
+        if p.exists():
+            return p
+    return None
+
+IMG1 = find_asset("Infusion1.jpg")   # microscope image
+IMG2 = find_asset("Infusion.jpg")    # infusion pump image
 
 # Optional Google Drive upload
 DEFAULT_DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
@@ -111,14 +124,10 @@ def head_cap(df: pd.DataFrame, n: int) -> pd.DataFrame:
 
 # ---------- Excel styling helpers (openpyxl) ----------
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.styles import Alignment, Font, PatternFill
 
 def _apply_common_sheet_style(ws, col_widths: dict, row_height: int):
-    # column widths
-    for idx, col_name in enumerate(ws.iter_cols(min_row=1, max_row=1, values_only=True)[0], start=1):
-        # this path won't be used; we prefer name-based mapping that follows
-        pass
-    # name-based mapping (case-insensitive)
+    # name-based mapping (case-insensitive exact header)
     name_to_index = {str(cell.value).strip(): cell.column for cell in ws[1] if cell.value}
 
     for name, width in col_widths.items():
@@ -171,33 +180,32 @@ def df_to_excel_bytes_styled(df: pd.DataFrame, kind: str) -> bytes:
             _apply_common_sheet_style(ws, col_widths, row_height=30)
 
         elif kind == "dvp":
-            # Defaults = 15; Requirements 60; Test Procedure 60; Acceptance Criteria 100
+            # Defaults = 15; Requirements 60; Test Procedure 60; Acceptance Criteria 100; row height 60
             col_widths = {c: 15 for c in df.columns}
-            for nm in ("Requirements",):
-                if nm in df.columns: col_widths[nm] = 60
+            if "requirements" in df.columns: col_widths["requirements"] = 60
+            if "Requirements" in df.columns: col_widths["Requirements"] = 60
             for nm in ("test_procedure", "Test Procedure"):
-                col_widths[nm] = 60
+                if nm in df.columns: col_widths[nm] = 60
             for nm in ("acceptance_criteria", "Acceptance Criteria"):
-                col_widths[nm] = 100
+                if nm in df.columns: col_widths[nm] = 100
             _apply_common_sheet_style(ws, col_widths, row_height=60)
 
         else:  # tm
             # Defaults = 15; Requirements 100; HA Risk Control 100
             col_widths = {c: 15 for c in df.columns}
             for nm in ("Requirements",):
-                col_widths[nm] = 100
+                if nm in df.columns: col_widths[nm] = 100
             for nm in ("HA Risk Control", "ha_risk_controls"):
-                col_widths[nm] = 100
+                if nm in df.columns: col_widths[nm] = 100
             _apply_common_sheet_style(ws, col_widths, row_height=30)
 
     buf.seek(0)
     return buf.read()
 
 
-# ---------- Simple metrics helpers (unchanged logic, just styled) ----------
+# ---------- Simple metrics helpers ----------
 GREEN = "#0F9D58"
 RED   = "#D93025"
-GRAY  = "#6B7280"
 BLUE  = "#2563EB"
 PURPLE = "#6B46C1"
 
@@ -216,7 +224,6 @@ def ha_metrics(ha_df: pd.DataFrame) -> dict:
         "sequence_of_events", "severity_of_harm", "p0", "p1", "poh",
         "risk_index", "risk_control"
     ]
-    # count non-TBD cells across key fields
     filled = 0
     total_cells = len(ha_df) * len(keys)
     for k in keys:
@@ -225,11 +232,8 @@ def ha_metrics(ha_df: pd.DataFrame) -> dict:
             continue
         filled += sum(col.apply(_not_tbd_value))
     completeness = pct(filled, total_cells)
-
-    # very light "diversity": unique combinations of (risk_to_health, hazard, hazardous_situation, harm)
     uniq = ha_df[["risk_to_health", "hazard", "hazardous_situation", "harm"]].drop_duplicates().shape[0]
     diversity = pct(uniq, len(ha_df))
-
     return {"completeness": completeness, "diversity": diversity}
 
 def dvp_metrics(dvp_df: pd.DataFrame) -> dict:
@@ -253,8 +257,7 @@ def dvp_metrics(dvp_df: pd.DataFrame) -> dict:
         measurable = sum(bool(re.search(rf"\d+(?:\.\d+)?\s?(?:{unit_pat})", str(v))) for v in tp)
     measurable_pct = pct(measurable, len(dvp_df))
 
-    # severity↔sample alignment (from HA severities) — proxy is kept as before: 70% threshold shown in UI
-    align_pct = 100.0  # computed in backend already; keep 100 here as a simple proxy
+    align_pct = 100.0  # simple proxy
     return {"completeness": completeness, "measurable": measurable_pct, "align": align_pct}
 
 def tm_metrics(tm_df: pd.DataFrame) -> dict:
@@ -265,8 +268,6 @@ def tm_metrics(tm_df: pd.DataFrame) -> dict:
               "Verification ID", "Verification Method", "Acceptance Criteria"]
     present = sum(1 for f in fields if f in tm_df.columns)
     completeness = pct(present, len(fields))
-
-    # req↔control mapping: require both Requirements AND HA Risk Control non-empty
     req = tm_df.get("Requirements")
     rc  = tm_df.get("HA Risk Control")
     mapped = 0
@@ -323,21 +324,25 @@ def render_metrics(ha_df, dvp_df, tm_df):
 # ---------------- UI ----------------
 st.set_page_config(page_title="DHF Automation – Infusion Pump", layout="wide")
 
-# Title row (icon + single-line title + hero images nearby)
+# Title row (AI Agent icon + single-line purple title + hero images nearby)
 top = st.container()
 with top:
     col_title, col_imgs = st.columns([0.62, 0.38])
 
     with col_title:
-        # puzzle icon (larger) + single line purple title
-        icon_size = 42
+        # AI Agent / Bot icon SVG (larger)
+        icon_size = 44
+        ai_svg = f"""
+        <svg viewBox="0 0 24 24" width="{icon_size}" height="{icon_size}" xmlns="http://www.w3.org/2000/svg">
+          <path fill="#8B5CF6" d="M12 2a3 3 0 0 1 3 3v1h1a4 4 0 0 1 4 4v5a6 6 0 0 1-6 6h-4a6 6 0 0 1-6-6V10a4 4 0 0 1 4-4h1V5a3 3 0 0 1 3-3z"/>
+          <circle cx="9" cy="11" r="1.5" fill="#fff"/>
+          <circle cx="15" cy="11" r="1.5" fill="#fff"/>
+          <rect x="8.5" y="14" width="7" height="1.75" rx="0.8" fill="#fff"/>
+        </svg>
+        """
         title_html = f"""
         <div style="display:flex; align-items:center; gap:14px;">
-          <div style="width:{icon_size}px; height:{icon_size}px;">
-            <svg viewBox="0 0 24 24" width="{icon_size}" height="{icon_size}">
-              <path fill="#A3E635" d="M12 2a2 2 0 0 1 2 2v1h1a2 2 0 0 1 2 2v1h1a2 2 0 0 1 2 2v2h-3a2 2 0 1 0 0 4h3v2a2 2 0 0 1-2 2h-1v1a2 2 0 0 1-2 2h-2v-3a2 2 0 1 0-4 0v3H9a2 2 0 0 1-2-2v-1H6a2 2 0 0 1-2-2v-2h3a2 2 0 1 0 0-4H4V8a2 2 0 0 1 2-2h1V5a2 2 0 0 1 2-2h3z"/>
-            </svg>
-          </div>
+          <div>{ai_svg}</div>
           <h1 style="margin:0; white-space:nowrap; color:{PURPLE};">
             DHF Automation – Infusion Pump
           </h1>
@@ -348,11 +353,11 @@ with top:
 
     with col_imgs:
         # place both images near the title, slightly larger if available
-        if IMG1.exists() or IMG2.exists():
+        if IMG1 or IMG2:
             i1, i2 = st.columns(2)
-            if IMG1.exists():
+            if IMG1:
                 i1.image(str(IMG1), use_container_width=True)
-            if IMG2.exists():
+            if IMG2:
                 i2.image(str(IMG2), use_container_width=True)
 
 # Inputs
@@ -411,10 +416,10 @@ if run_btn:
         }
         ha_resp = call_backend("/hazard-analysis", ha_payload)
         ha_rows = ha_resp.get("ha", [])
-        ha_df = pd.DataFrame(ha_rows)
+        ha_df_full = pd.DataFrame(ha_rows)
 
-    # hide requirement_id column in preview/export (per your earlier request)
-    ha_df = ha_df[
+    # preview/export selection (hide requirement_id)
+    ha_df = ha_df_full[
         [
             "risk_id", "risk_to_health", "hazard", "hazardous_situation",
             "harm", "sequence_of_events", "severity_of_harm", "p0", "p1", "poh",
@@ -438,8 +443,6 @@ if run_btn:
         st.error(f"DVP backend error: {e}")
         st.stop()
     dvp_df = pd.DataFrame(dvp_rows)
-
-    # keep canonical names for export & width mapping
     dvp_df = dvp_df[
         ["verification_id", "requirement_id", "requirements",
          "verification_method", "sample_size", "test_procedure", "acceptance_criteria"]
@@ -455,7 +458,7 @@ if run_btn:
             "ha": ha_rows,
             "dvp": dvp_rows,
         }
-        tm_resp = call_backend("/tm", tm_payload)  # backend returns {"ok":true,"tm":[...]}
+        tm_resp = call_backend("/tm", tm_payload)
         tm_rows = tm_resp.get("tm", [])
         tm_df = pd.DataFrame(tm_rows)
 
