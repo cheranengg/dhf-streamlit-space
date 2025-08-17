@@ -1,17 +1,19 @@
 # app.py — DHF Streamlit UI (Preview + ZIP Download)
-# --------------------------------------------------
 
 import os
 import io
 import json
 import zipfile
 import typing as t
+from collections import Counter
 
 import pandas as pd
 import streamlit as st
 import requests
 
-# ---------------- Constants & Secrets ----------------
+# =========================
+# Config & constants
+# =========================
 TBD = "TBD - Human / SME input"
 
 BACKEND_URL = st.secrets.get("BACKEND_URL", "http://localhost:8080")
@@ -22,7 +24,7 @@ HA_MAX_ROWS = int(os.getenv("HA_MAX_ROWS", "50"))
 DVP_MAX_ROWS = int(os.getenv("DVP_MAX_ROWS", "50"))
 TM_MAX_ROWS  = int(os.getenv("TM_MAX_ROWS", "50"))
 
-# NEW: cap how many requirements we send to backend
+# How many requirements we send to backend
 REQ_MAX = int(os.getenv("REQ_MAX", "50"))
 
 # Optional Google Drive upload
@@ -30,14 +32,49 @@ DEFAULT_DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
 OUTPUT_DIR = st.secrets.get("OUTPUT_DIR", os.path.abspath("./streamlit_outputs"))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ---------------- Optional Google Drive (pydrive2) ----------------
+# =========================
+# Style (green primary button, compact layout)
+# =========================
+st.set_page_config(page_title="DHF Automation – Infusion Pump", layout="wide")
+st.markdown("""
+<style>
+/* Make primary buttons green */
+.stButton > button[kind="primary"] {
+  background-color: #16a34a !important;  /* tailwind-green-600 */
+  color: white !important;
+  border: 1px solid #15803d !important;
+}
+.stButton > button[kind="primary"]:hover {
+  background-color: #15803d !important;  /* green-700 */
+}
+/* Header spacing */
+.block-container { padding-top: 1.2rem; }
+</style>
+""", unsafe_allow_html=True)
+
+# =========================
+# Image helpers
+# =========================
+ASSETS_DIR = "streamlit_assets"
+INFUSION1_PATH = os.path.join(ASSETS_DIR, "Infusion1.jpg")  # bedside pump (first)
+INFUSION_PATH  = os.path.join(ASSETS_DIR, "Infusion.jpg")   # lab image (second)
+
+def try_image(path: str) -> t.Optional[bytes]:
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+
+# =========================
+# Optional Google Drive (pydrive2)
+# =========================
 _HAS_DRIVE = True
 try:
     from pydrive2.auth import GoogleAuth
     from pydrive2.drive import GoogleDrive
 except Exception:
     _HAS_DRIVE = False
-
 
 def init_drive() -> t.Optional["GoogleDrive"]:
     if not _HAS_DRIVE:
@@ -64,15 +101,15 @@ def init_drive() -> t.Optional["GoogleDrive"]:
         gauth.ServiceAuth()
     return GoogleDrive(gauth)
 
-
 def drive_upload_bytes(drive: "GoogleDrive", folder_id: str, filename: str, data: bytes) -> str:
     file = drive.CreateFile({"title": filename, "parents": [{"id": folder_id}]})
     file.content = io.BytesIO(data)
     file.Upload()
     return file["id"]
 
-
-# ---------------- Helpers ----------------
+# =========================
+# Helpers
+# =========================
 def normalize_requirements(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {}
     for c in df.columns:
@@ -89,24 +126,16 @@ def normalize_requirements(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = None
     return df[["Requirement ID", "Verification ID", "Requirements"]].copy()
 
+def call_backend(endpoint: str, payload: dict) -> dict:
+    url = f"{BACKEND_URL.rstrip('/')}{endpoint}"
+    headers = {"Authorization": f"Bearer {BACKEND_TOKEN}", "Content-Type": "application/json"}
+    r = requests.post(url, headers=headers, json=payload, timeout=1200)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Backend error {r.status_code}: {r.text[:500]}")
+    return r.json()
 
-def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df.to_excel(w, index=False)
-    buf.seek(0)
-    return buf.read()
-
-
-def basic_guardrails_df(df: pd.DataFrame, required_cols: t.List[str]) -> pd.DataFrame:
-    issues = []
-    for i, row in df.iterrows():
-        for c in required_cols:
-            val = str(row.get(c, "")).strip()
-            if not val or val in {"NA", TBD}:
-                issues.append((i, c, "Missing or TBD"))
-    return pd.DataFrame(issues, columns=["row_index", "column", "issue"]) if issues else pd.DataFrame(columns=["row_index", "column", "issue"])
-
+def head_cap(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    return df.head(n).copy() if isinstance(df, pd.DataFrame) and not df.empty else df
 
 def fill_tbd(df: pd.DataFrame, cols: t.List[str]) -> pd.DataFrame:
     out = df.copy()
@@ -118,25 +147,133 @@ def fill_tbd(df: pd.DataFrame, cols: t.List[str]) -> pd.DataFrame:
         out.loc[out[c].astype(str).str.upper().eq("NA"), c] = TBD
     return out
 
+# =========================
+# Excel formatting helpers (openpyxl)
+# =========================
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.worksheet.worksheet import Worksheet
 
-def call_backend(endpoint: str, payload: dict) -> dict:
-    url = f"{BACKEND_URL.rstrip('/')}{endpoint}"
-    headers = {"Authorization": f"Bearer {BACKEND_TOKEN}", "Content-Type": "application/json"}
-    r = requests.post(url, headers=headers, json=payload, timeout=1200)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Backend error {r.status_code}: {r.text[:500]}")
-    return r.json()
+GREEN = "D1FAE5"  # soft green header
+HEADER_FONT = Font(bold=True)
+WRAP_ALIGN = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
+def df_to_excel_bytes_with_format(
+    df: pd.DataFrame,
+    col_width_default: int = 15,
+    col_width_overrides: t.Optional[dict] = None,
+    freeze_cell: str = "D2",
+    row_height: int = 30
+) -> bytes:
+    wb = Workbook()
+    ws: Worksheet = wb.active
 
-def head_cap(df: pd.DataFrame, n: int) -> pd.DataFrame:
-    return df.head(n).copy() if isinstance(df, pd.DataFrame) and not df.empty else df
+    # Write DataFrame
+    for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=True), start=1):
+        ws.append(row)
 
+    # Header style
+    max_col = ws.max_column
+    for c in range(1, max_col + 1):
+        cell = ws.cell(row=1, column=c)
+        cell.font = HEADER_FONT
+        cell.fill = PatternFill(start_color=GREEN, end_color=GREEN, fill_type="solid")
 
-# ---------------- UI ----------------
-st.set_page_config(page_title="DHF Automation – Infusion Pump", layout="wide")
-st.title("🧩 DHF Automation – Infusion Pump")
-st.caption("Requirements → Hazard Analysis → DVP → TM | Guardrails + Preview | One-click ZIP download")
+    # Column widths
+    widths = {i: col_width_default for i in range(1, max_col + 1)}
+    if col_width_overrides:
+        for col_name, width in col_width_overrides.items():
+            if col_name in df.columns:
+                idx = df.columns.get_loc(col_name) + 1
+                widths[idx] = width
+    for i, w in widths.items():
+        ws.column_dimensions[chr(64 + i)].width = w
 
+    # Row heights + alignment
+    for r in range(1, ws.max_row + 1):
+        ws.row_dimensions[r].height = row_height
+        for c in range(1, max_col + 1):
+            ws.cell(row=r, column=c).alignment = WRAP_ALIGN
+
+    # Freeze panes
+    ws.freeze_panes = freeze_cell
+
+    # Save
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+# =========================
+# Metrics
+# =========================
+def compute_metrics(ha_df: pd.DataFrame, dvp_df: pd.DataFrame, tm_df: pd.DataFrame) -> dict:
+    metrics = {}
+
+    # HA
+    ha_count = len(ha_df)
+    sev_counts = Counter(ha_df.get("severity_of_harm", []))
+    top_sev = max(sev_counts.items(), key=lambda x: x[1])[0] if sev_counts else "–"
+    rth_unique = ha_df.get("risk_to_health", pd.Series(dtype=str)).nunique()
+    metrics["HA"] = {
+        "rows": ha_count,
+        "unique_risk_to_health": int(rth_unique),
+        "most_common_severity": str(top_sev)
+    }
+
+    # DVP
+    non_tbd_method = (dvp_df.get("verification_method", "").astype(str).str.contains("TBD", case=False, na=False) == False).sum()
+    non_tbd_accept = (dvp_df.get("acceptance_criteria", "").astype(str).str.contains("TBD", case=False, na=False) == False).sum()
+    dvp_count = max(len(dvp_df), 1)
+    metrics["DVP"] = {
+        "rows": len(dvp_df),
+        "method_filled_pct": round(100 * non_tbd_method / dvp_count, 1),
+        "acceptance_filled_pct": round(100 * non_tbd_accept / dvp_count, 1),
+    }
+
+    # TM
+    tm_count = len(tm_df)
+    tm_cov_vid = (tm_df.get("Verification ID", "").astype(str).str.upper() != "TBD - HUMAN / SME INPUT").sum()
+    tm_cov_risk = (tm_df.get("Risk ID", "").astype(str).str.upper() != "TBD - HUMAN / SME INPUT").sum()
+    metrics["TM"] = {
+        "rows": tm_count,
+        "verification_linked_pct": round(100 * tm_cov_vid / max(tm_count, 1), 1),
+        "risk_linked_pct": round(100 * tm_cov_risk / max(tm_count, 1), 1),
+    }
+    return metrics
+
+def render_metrics(metrics: dict):
+    st.subheader("Evaluation Metrics")
+    ha = metrics.get("HA", {})
+    dvp = metrics.get("DVP", {})
+    tm  = metrics.get("TM", {})
+    st.markdown(f"""
+- **Hazard Analysis**: {ha.get('rows','–')} rows · {ha.get('unique_risk_to_health','–')} risk types · most common severity **{ha.get('most_common_severity','–')}**
+- **Design Verification Protocol**: methods filled **{dvp.get('method_filled_pct','–')}%**, acceptance criteria filled **{dvp.get('acceptance_filled_pct','–')}%**
+- **Trace Matrix**: verification linked **{tm.get('verification_linked_pct','–')}%**, risk linked **{tm.get('risk_linked_pct','–')}%**
+""")
+    st.caption("Notes: These simple coverage indicators help spot obvious gaps. Review high-severity risks and any TBD fields with an SME before sign-off.")
+
+# =========================
+# Page Header (with images on the right)
+# =========================
+left, right = st.columns([3, 2], vertical_alignment="center")
+with left:
+    st.title("🧩 DHF Automation – Infusion Pump")
+    st.caption("Requirements → Hazard Analysis → DVP → TM")
+with right:
+    img1 = try_image(INFUSION1_PATH)  # bedside pump (first)
+    img2 = try_image(INFUSION_PATH)   # lab image (second)
+    r1, r2 = st.columns(2)
+    if img1:
+        r1.image(img1, caption="", use_column_width=True)
+    if img2:
+        r2.image(img2, caption="", use_column_width=True)
+
+# =========================
+# Inputs
+# =========================
 st.markdown("**Provide Product Requirements** (choose one):")
 colA, colB = st.columns(2)
 with colA:
@@ -147,8 +284,11 @@ with colB:
 
 run_btn = st.button("▶️ Generate DHF Packages", type="primary")
 
+# =========================
+# Main flow
+# =========================
 if run_btn:
-    # -------- Parse Requirements --------
+    # Parse Requirements
     with st.spinner("Parsing requirements..."):
         if uploaded is not None:
             try:
@@ -165,19 +305,18 @@ if run_btn:
         else:
             st.error("Please upload an Excel file or paste CSV text.")
             st.stop()
-
         req_df = normalize_requirements(req_df)
 
     total_reqs = len(req_df)
     st.success(f"Loaded {total_reqs} requirements.")
     st.dataframe(head_cap(req_df, 20), use_container_width=True)
 
-    # -------- Limit how many requirements are SENT to backend --------
+    # Limit what we send to backend
     req_df_limited = req_df.head(REQ_MAX).copy()
     if total_reqs > REQ_MAX:
         st.info(f"Sending only the first {REQ_MAX} requirements to backend (set REQ_MAX env var to change).")
 
-    # -------- Call Backend: HA --------
+    # ---- HA
     with st.spinner("Running Hazard Analysis (backend)..."):
         ha_payload = {
             "requirements": [
@@ -186,7 +325,7 @@ if run_btn:
                     "Verification ID": r.get("Verification ID"),
                     "Requirements": r.get("Requirements"),
                 }
-                for _, r in req_df_limited.iterrows()  # <— limited
+                for _, r in req_df_limited.iterrows()
             ]
         }
         ha_resp = call_backend("/hazard-analysis", ha_payload)
@@ -196,20 +335,17 @@ if run_btn:
     ha_df = fill_tbd(
         ha_df,
         [
-            "requirement_id", "risk_id", "risk_to_health", "hazard", "hazardous_situation",
+            "risk_id", "risk_to_health", "hazard", "hazardous_situation",
             "harm", "sequence_of_events", "severity_of_harm", "p0", "p1", "poh", "risk_index", "risk_control",
         ],
     )
     st.subheader(f"Hazard Analysis (preview, first {HA_MAX_ROWS})")
-    # Hide requirement_id in the table shown to users (it still exists in ha_df for joins)
-    ha_preview = ha_df.drop(columns=["requirement_id"], errors="ignore")
-    st.dataframe(head_cap(ha_preview, HA_MAX_ROWS), use_container_width=True)
+    st.dataframe(head_cap(ha_df, HA_MAX_ROWS), use_container_width=True)
 
-
-    # -------- Call Backend: DVP --------
+    # ---- DVP
     with st.spinner("Generating Design Verification Protocol (backend)..."):
         dvp_payload = {
-            "requirements": ha_payload["requirements"],  # already limited
+            "requirements": ha_payload["requirements"],
             "ha": ha_rows,
         }
     try:
@@ -219,23 +355,21 @@ if run_btn:
         st.error(f"DVP backend error: {e}")
         st.stop()
     dvp_df = pd.DataFrame(dvp_rows)
-
     dvp_df = fill_tbd(dvp_df, ["verification_id", "verification_method", "acceptance_criteria", "sample_size", "test_procedure"])
     st.subheader(f"Design Verification Protocol (preview, first {DVP_MAX_ROWS})")
     st.dataframe(head_cap(dvp_df, DVP_MAX_ROWS), use_container_width=True)
 
-    # -------- Call Backend: TM --------
+    # ---- TM
     with st.spinner("Building Trace Matrix (backend)..."):
         tm_payload = {
-            "requirements": ha_payload["requirements"],  # already limited
+            "requirements": ha_payload["requirements"],
             "ha": ha_rows,
             "dvp": dvp_rows,
         }
-        tm_resp = call_backend("/tm", tm_payload)  # backend returns {"ok":true,"tm":[...]}
+        tm_resp = call_backend("/tm", tm_payload)
         tm_rows = tm_resp.get("tm", [])
         tm_df = pd.DataFrame(tm_rows)
 
-    # === NEW: exact TM column order & names to match your Excel ===
     TM_ORDER = [
         "Requirement ID",
         "Requirements",
@@ -246,34 +380,45 @@ if run_btn:
         "Verification ID",
         "Verification Method",
     ]
-    # Reindex to enforce order; fill missing with TBD/NA as needed
     tm_df = tm_df.reindex(columns=TM_ORDER)
     tm_df = fill_tbd(tm_df, TM_ORDER)
 
     st.subheader(f"Trace Matrix (preview, first {TM_MAX_ROWS})")
     st.dataframe(head_cap(tm_df, TM_MAX_ROWS), use_container_width=True)
 
-    # -------- Preview-only Guardrails --------
-    st.subheader("Human-in-the-Loop (preview only)")
-    # Validate critical identity columns present
-    guardrail_required = ["Requirement ID", "Requirements", "Verification ID"]
-    issues = basic_guardrails_df(tm_df, guardrail_required)
-    if issues is not None and not issues.empty:
-        st.info(f"Guardrails flagged {len(issues)} issue(s). Review the Trace Matrix above before export.")
-    else:
-        st.success("No guardrail issues detected in the Trace Matrix.")
+    # ---- Metrics (instead of guardrails)
+    metrics = compute_metrics(ha_df, dvp_df, tm_df)
+    render_metrics(metrics)
 
-    # -------- Prepare Exports (capped) --------
+    # ---- Exports with formatting
     ha_export_cols = [
         "risk_id", "risk_to_health", "hazard", "hazardous_situation",
         "harm", "sequence_of_events", "severity_of_harm", "p0", "p1", "poh", "risk_index", "risk_control",
     ]
     dvp_export_cols = ["verification_id", "verification_method", "acceptance_criteria", "sample_size", "test_procedure"]
-    tm_export_cols = TM_ORDER[:]  # same order as preview
+    tm_export_cols  = TM_ORDER[:]
 
-    ha_bytes = df_to_excel_bytes(head_cap(ha_df[ha_export_cols], HA_MAX_ROWS))
-    dvp_bytes = df_to_excel_bytes(head_cap(dvp_df[dvp_export_cols], DVP_MAX_ROWS))
-    tm_bytes  = df_to_excel_bytes(head_cap(tm_df[tm_export_cols], TM_MAX_ROWS))
+    ha_bytes = df_to_excel_bytes_with_format(
+        head_cap(ha_df[ha_export_cols], HA_MAX_ROWS),
+        col_width_default=15,
+        col_width_overrides={"risk_control": 100},
+        freeze_cell="D2",  # freeze row 2, col 4
+        row_height=30
+    )
+    dvp_bytes = df_to_excel_bytes_with_format(
+        head_cap(dvp_df[dvp_export_cols], DVP_MAX_ROWS),
+        col_width_default=15,
+        col_width_overrides={"acceptance_criteria": 100, "test_procedure": 100},
+        freeze_cell="D2",
+        row_height=30
+    )
+    tm_bytes = df_to_excel_bytes_with_format(
+        head_cap(tm_df[tm_export_cols], TM_MAX_ROWS),
+        col_width_default=15,
+        col_width_overrides={},
+        freeze_cell="D2",
+        row_height=30
+    )
 
     # Save locally
     with open(os.path.join(OUTPUT_DIR, "Hazard_Analysis.xlsx"), "wb") as f:
@@ -283,7 +428,7 @@ if run_btn:
     with open(os.path.join(OUTPUT_DIR, "Trace_Matrix.xlsx"), "wb") as f:
         f.write(tm_bytes)
 
-    # -------- One-click ZIP Download --------
+    # One-click ZIP Download
     st.subheader("Download DHF Package")
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -300,36 +445,5 @@ if run_btn:
         type="primary"
     )
     if clicked:
-        st.success("Hazard Analysis, Design Verification Protocol, Trace Matrix documents downloaded successfully.")
-
-    # -------- Optional Google Drive upload --------
-    if DEFAULT_DRIVE_FOLDER_ID:
-        with st.spinner("Uploading files to Google Drive..."):
-            drive = init_drive()
-            if drive:
-                try:
-                    ha_id = drive_upload_bytes(drive, DEFAULT_DRIVE_FOLDER_ID, "Hazard_Analysis.xlsx", ha_bytes)
-                    dvp_id = drive_upload_bytes(drive, DEFAULT_DRIVE_FOLDER_ID, "Design_Verification_Protocol.xlsx", dvp_bytes)
-                    tm_id = drive_upload_bytes(drive, DEFAULT_DRIVE_FOLDER_ID, "Trace_Matrix.xlsx", tm_bytes)
-                    st.info("Uploaded to Google Drive (file IDs shown below).")
-                    st.json({
-                        "Hazard_Analysis.xlsx": ha_id,
-                        "Design_Verification_Protocol.xlsx": dvp_id,
-                        "Trace_Matrix.xlsx": tm_id,
-                    })
-                except Exception as e:
-                    st.warning(f"Drive upload failed: {e}")
-            else:
-                st.info("Drive not initialized (missing SERVICE_ACCOUNT_JSON secret). Files saved locally only.")
-
-st.markdown("---")
-st.markdown(
-    f"""
-**Files & Hosting**
-- Outputs are saved locally to: `{OUTPUT_DIR}` and (optionally) uploaded to your Google Drive folder: `{DEFAULT_DRIVE_FOLDER_ID or '—'}`.
-- Backend is expected at `{BACKEND_URL}` with bearer auth.
-- Guardrails are applied (null/empty/NA ⇒ `{TBD}`).
-- Preview and exports are capped to: HA={HA_MAX_ROWS}, DVP={DVP_MAX_ROWS}, TM={TM_MAX_ROWS}.
-- Sending only the first {REQ_MAX} requirements to backend.
-"""
-)
+        st.success("DHF documents downloaded successfully — Hazard Analysis, Design Verification Protocol, Trace Matrix")
+        st.info("Note: Please involve Medical Device SME reviews before final approval.")
