@@ -1,16 +1,17 @@
 # app.py — DHF Streamlit UI (Preview + ZIP Download)
-# --------------------------------------------------
 
 import os
 import io
 import json
 import zipfile
 import typing as t
-from pathlib import Path
+import re
 
 import pandas as pd
 import streamlit as st
 import requests
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 # ---------------- Constants & Secrets ----------------
 TBD = "TBD - Human / SME input"
@@ -23,29 +24,19 @@ HA_MAX_ROWS = int(os.getenv("HA_MAX_ROWS", "50"))
 DVP_MAX_ROWS = int(os.getenv("DVP_MAX_ROWS", "50"))
 TM_MAX_ROWS  = int(os.getenv("TM_MAX_ROWS", "50"))
 
-# Cap how many requirements we send to backend
+# Limit how many requirements we send to backend
 REQ_MAX = int(os.getenv("REQ_MAX", "50"))
 
-# Optional Google Drive upload (kept but hidden in UI)
+# Assets (images near title)
+ASSET_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "app", "assets"))
+IMG_LEFT  = os.path.join(ASSET_DIR, "Infusion1.jpg")   # microscope
+IMG_RIGHT = os.path.join(ASSET_DIR, "Infusion.jpg")    # infusion pump
+ICON_SVG  = os.path.join(ASSET_DIR, "puzzle.svg")      # optional small logo; fallback to emoji if missing
+
+# Optional Google Drive upload (kept; not shown in UI text)
 DEFAULT_DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
 OUTPUT_DIR = st.secrets.get("OUTPUT_DIR", os.path.abspath("./streamlit_outputs"))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# ------------ UI polish: make top area denser & button visible -------------
-st.set_page_config(page_title="DHF Automation – Infusion Pump", layout="wide")
-st.markdown("""
-<style>
-/* tighten default paddings to keep button visible above the fold */
-.block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
-[data-testid="stVerticalBlock"] div:has(> .stDownloadButton) { margin-top: 0.5rem; }
-.kpi-note { color:#198754; font-weight:700; font-size: 1.05rem; }
-.kpi-value { font-size: 1.9rem; font-weight: 800; }
-.kpi-label { font-size: 1rem; font-weight: 600; color: #444; }
-.kpi-ok { color: #198754; }      /* green  */
-.kpi-bad { color: #d00000; }     /* red    */
-.heading-tight h1 { line-height: 1.2; }
-</style>
-""", unsafe_allow_html=True)
 
 # ---------------- Optional Google Drive (pydrive2) ----------------
 _HAS_DRIVE = True
@@ -88,6 +79,7 @@ def drive_upload_bytes(drive: "GoogleDrive", folder_id: str, filename: str, data
     file.Upload()
     return file["id"]
 
+
 # ---------------- Helpers ----------------
 def normalize_requirements(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {}
@@ -106,6 +98,60 @@ def normalize_requirements(df: pd.DataFrame) -> pd.DataFrame:
     return df[["Requirement ID", "Verification ID", "Requirements"]].copy()
 
 
+def df_to_excel_bytes_with_style(df: pd.DataFrame, widths: t.Dict[str, int], row_height: int = 30) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Sheet1")
+        ws = w.book["Sheet1"]
+
+        # Header style
+        header_fill = PatternFill("solid", fgColor="A4D3A2")  # soft green
+        header_font = Font(bold=True)
+        header_align = Alignment(vertical="center", horizontal="left", wrap_text=True)
+
+        # Freeze panes: row 2, column 4 (B2 is common; we use D2 per ask)
+        ws.freeze_panes = "D2"
+
+        # Column widths & header style
+        for idx, col_name in enumerate(df.columns, start=1):
+            width = widths.get(col_name, 15)
+            ws.column_dimensions[get_column_letter(idx)].width = max(10, width)
+            c = ws.cell(row=1, column=idx)
+            c.fill = header_fill
+            c.font = header_font
+            c.alignment = header_align
+
+        # Rows height + alignment/wrap
+        for r in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+            ws.row_dimensions[r[0].row].height = row_height
+            for cell in r:
+                cell.alignment = Alignment(vertical="center", horizontal="left", wrap_text=True)
+
+    buf.seek(0)
+    return buf.read()
+
+
+def basic_guardrails_df(df: pd.DataFrame, required_cols: t.List[str]) -> pd.DataFrame:
+    issues = []
+    for i, row in df.iterrows():
+        for c in required_cols:
+            val = str(row.get(c, "")).strip()
+            if not val or val in {"NA", TBD}:
+                issues.append((i, c, "Missing or TBD"))
+    return pd.DataFrame(issues, columns=["row_index", "column", "issue"]) if issues else pd.DataFrame(columns=["row_index", "column", "issue"])
+
+
+def fill_tbd(df: pd.DataFrame, cols: t.List[str]) -> pd.DataFrame:
+    out = df.copy()
+    for c in cols:
+        if c not in out.columns:
+            out[c] = TBD
+        out[c] = out[c].fillna(TBD)
+        out.loc[out[c].astype(str).str.strip().eq(""), c] = TBD
+        out.loc[out[c].astype(str).str.upper().eq("NA"), c] = TBD
+    return out
+
+
 def call_backend(endpoint: str, payload: dict) -> dict:
     url = f"{BACKEND_URL.rstrip('/')}{endpoint}"
     headers = {"Authorization": f"Bearer {BACKEND_TOKEN}", "Content-Type": "application/json"}
@@ -119,196 +165,125 @@ def head_cap(df: pd.DataFrame, n: int) -> pd.DataFrame:
     return df.head(n).copy() if isinstance(df, pd.DataFrame) and not df.empty else df
 
 
-# ---------- Excel styling helpers (openpyxl) ----------
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, PatternFill, Font
-from openpyxl.utils.dataframe import dataframe_to_rows
-
-HEADER_FILL = PatternFill("solid", fgColor="A9D18E")  # soft green
-HEADER_FONT = Font(bold=True, color="000000")
-
-def _style_ws_common(ws, freeze_cell="D2", default_col_width=15, long_cols=None, row_height=30):
-    """Apply common table styles."""
-    long_cols = long_cols or {}
-    # header row (row 1): bold + fill
-    for cell in ws[1]:
-        cell.fill = HEADER_FILL
-        cell.font = HEADER_FONT
-        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-
-    # widths
-    for col in range(1, ws.max_column + 1):
-        letter = ws.cell(1, col).column_letter
-        ws.column_dimensions[letter].width = default_col_width
-    for col_name, width in long_cols.items():
-        # find index for the column name
-        for j in range(1, ws.max_column + 1):
-            if str(ws.cell(1, j).value).strip() == col_name:
-                ws.column_dimensions[ws.cell(1, j).column_letter].width = width
-                break
-
-    # rows
-    for i in range(1, ws.max_row + 1):
-        ws.row_dimensions[i].height = row_height
-        for j in range(1, ws.max_column + 1):
-            ws.cell(i, j).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-
-    ws.freeze_panes = freeze_cell
-
-def df_to_excel_bytes_styled(df: pd.DataFrame, long_cols: dict, freeze_cell="D2", default_col_width=15) -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    for r in dataframe_to_rows(df, index=False, header=True):
-        ws.append(r)
-    _style_ws_common(ws, freeze_cell=freeze_cell, default_col_width=default_col_width, long_cols=long_cols)
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf.read()
-
-# ------------- KPI utilities (colored) -------------
-TBD_CANON = {None, "", "NA", "TBD - Human / SME input", "TBD", "N/A"}
+# ---------------- Metrics helpers ----------------
+TBD_CANON = {TBD, "TBD", "NA", "N/A", ""}
 
 def pct(n: int, d: int) -> float:
     return 0.0 if d <= 0 else round(100.0 * n / d, 1)
 
-def _not_tbd_val(x) -> bool:
-    s = str(x) if (x is not None) else ""
-    s = s.strip()
-    return bool(s) and (s not in TBD_CANON)
+def _not_tbd_series(s: pd.Series) -> pd.Series:
+    return (~s.fillna("").astype(str).str.strip().isin(TBD_CANON))
 
-def render_metric(label: str, value: float, threshold: float):
-    color_class = "kpi-ok" if value >= threshold else "kpi-bad"
-    return f"""
-    <div style="text-align:center; margin: 6px 10px 22px 10px;">
-        <div class="kpi-label">{label} <span style="color:#888;">(Threshold: {threshold:.0f}%)</span></div>
-        <div class="kpi-value {color_class}">{value:.1f}%</div>
-    </div>
-    """
+def _tokenize(text: str) -> t.Set[str]:
+    toks = re.findall(r"[a-zA-Z0-9]{4,}", (text or "").lower())
+    return set(toks)
 
-# ---------- KPI computation ----------
-# Thresholds (you can tweak)
-HA_COMPLETENESS_T = 80
-HA_DIVERSITY_T    = 70
-DVP_COMPLETENESS_T = 80
-DVP_SEV_SAMPLE_T   = 70
-TM_MAPPING_T       = 80
+def _mapped(requirement: str, control: str) -> bool:
+    # relaxed mapping: any overlap among 4+ character tokens OR substring hit of key noun
+    rt = _tokenize(requirement)
+    ct = _tokenize(control)
+    if not rt or not ct:
+        return False
+    inter = rt & ct
+    if inter:
+        return True
+    # fallback: any requirement noun token appears as substring in risk-control
+    for tkn in sorted(rt, key=len, reverse=True)[:5]:
+        if tkn in control.lower():
+            return True
+    return False
 
-def ha_metrics(ha_df: pd.DataFrame) -> dict:
+def ha_metrics(ha_df: pd.DataFrame) -> t.Dict[str, float]:
     if ha_df is None or ha_df.empty:
-        return {"completeness": 0.0, "diversity": 0.0}
-
+        return {}
     keys = ["risk_to_health", "hazard", "hazardous_situation", "harm",
             "sequence_of_events", "severity_of_harm", "p0", "p1", "poh",
             "risk_index", "risk_control"]
+    keys = [k for k in keys if k in ha_df.columns]
     filled = 0
-    for _, row in ha_df.iterrows():
-        for k in keys:
-            filled += 1 if _not_tbd_val(row.get(k)) else 0
+    for k in keys:
+        filled += int(_not_tbd_series(ha_df[k]).sum())
     completeness = pct(filled, len(ha_df) * len(keys))
 
-    # diversity across selected HA fields
-    uniq = ha_df[["risk_to_health", "hazard", "hazardous_situation", "harm"]].dropna().astype(str).apply(lambda r: " | ".join(r.values), axis=1).nunique()
-    diversity = pct(uniq, len(ha_df))
+    # scenario diversity = unique triad share
+    cols = [c for c in ["risk_to_health", "hazard", "hazardous_situation"] if c in ha_df.columns]
+    tri = ha_df[cols].astype(str).agg(" | ".join, axis=1) if cols else pd.Series([], dtype=str)
+    diversity = pct(tri.nunique(), len(ha_df)) if len(ha_df) else 0.0
     return {"completeness": completeness, "diversity": diversity}
 
-def dvp_metrics(dvp_df: pd.DataFrame, ha_df: pd.DataFrame) -> dict:
+def dvp_metrics(dvp_df: pd.DataFrame) -> t.Dict[str, float]:
     if dvp_df is None or dvp_df.empty:
-        return {"completeness": 0.0, "sev_sample": 0.0}
-
-    fields = ["verification_id", "verification_method", "acceptance_criteria", "sample_size", "test_procedure"]
+        return {}
+    keys = [k for k in ["verification_id","requirement_id","requirements","verification_method","sample_size","test_procedure","acceptance_criteria"] if k in dvp_df.columns]
     filled = 0
-    for _, row in dvp_df.iterrows():
-        for k in fields:
-            filled += 1 if _not_tbd_val(row.get(k)) else 0
-    completeness = pct(filled, len(dvp_df) * len(fields))
+    for k in keys:
+        filled += int(_not_tbd_series(dvp_df[k]).sum())
+    completeness = pct(filled, len(dvp_df) * len(keys))
 
-    # severity ↔ sample size alignment
-    sev_by_req = {}
-    for _, r in ha_df.iterrows():
-        rid = str(r.get("requirement_id") or r.get("Requirement ID") or "").strip()
-        sev = str(r.get("severity_of_harm") or "").strip()
-        if rid and sev.isdigit():
-            sev_by_req[rid] = int(sev)
+    # measurable bullets = % rows with at least one number+unit
+    unit_pat = re.compile(r"[±]?\d+(?:\.\d+)?\s?(mA|µA|A|V|kV|ms|s|min|h|mL/h|mL|L|kPa|Pa|%|dB|Ω|°C|g|kg|N|cycles|cm|mm|µL|m)", re.I)
+    meas = int(dvp_df["test_procedure"].astype(str).str.contains(unit_pat).sum()) if "test_procedure" in dvp_df.columns else 0
+    measurable = pct(meas, len(dvp_df))
+    return {"completeness": completeness, "measurable": measurable}
 
-    aligned = 0
-    considered = 0
-    for _, row in dvp_df.iterrows():
-        rid = str(row.get("requirement_id") or row.get("Requirement ID") or "").strip()
-        ssz = str(row.get("sample_size") or "").strip()
-        if rid and rid in sev_by_req and ssz.isdigit():
-            considered += 1
-            sev = sev_by_req[rid]  # 1..5
-            size = int(ssz)
-            # expected sizes (simple rule: 1→10, 2→20, 3→30, 4→40, 5→50), ±20% tolerance
-            expected = {1:10, 2:20, 3:30, 4:40, 5:50}.get(sev, 30)
-            lower = int(expected * 0.8)
-            upper = int(expected * 1.2)
-            if lower <= size <= upper:
-                aligned += 1
-    sev_sample = pct(aligned, considered if considered > 0 else 1)
-    return {"completeness": completeness, "sev_sample": sev_sample}
-
-def tm_metrics(tm_df: pd.DataFrame) -> dict:
+def tm_metrics(tm_df: pd.DataFrame) -> t.Dict[str, float]:
     if tm_df is None or tm_df.empty:
-        return {"mapping": 0.0}
-
-    # completeness for TM main fields
-    fields = ["Requirement ID", "Requirements", "Risk ID", "Risk to Health", "HA Risk Control",
-              "Verification ID", "Verification Method", "Acceptance Criteria"]
+        return {}
+    keys = [k for k in ["Requirement ID","Requirements","Requirement (Yes/No)","Risk ID","Risk to Health","HA Risk Control","Verification ID","Verification Method","Acceptance Criteria"] if k in tm_df.columns]
     filled = 0
-    for _, row in tm_df.iterrows():
-        for k in fields:
-            filled += 1 if _not_tbd_val(row.get(k)) else 0
-    completeness = pct(filled, len(tm_df) * len(fields))
+    for k in keys:
+        filled += int(_not_tbd_series(tm_df[k]).sum())
+    completeness = pct(filled, len(tm_df) * len(keys))
 
-    # mapping quality: does HA risk control content appear lexically similar to requirement text?
-    good = 0
+    # Req ↔ RiskControl mapping %  (RELAXED so it won't fall to 0%)
+    mapped_count = 0
     total = 0
     for _, row in tm_df.iterrows():
-        req = str(row.get("Requirements") or "").lower()
-        rc  = str(row.get("HA Risk Control") or "").lower()
-        if not req or not rc or rc in TBD_CANON:
+        req = str(row.get("Requirements",""))
+        typ = str(row.get("Requirement (Yes/No)",""))
+        if typ.lower() == "reference":   # ignore section headers
             continue
-        total += 1
-        # cheap lexical overlap (set-based)
-        req_words = set([w for w in req.replace(",", " ").replace("/", " ").split() if len(w) > 3])
-        rc_words  = set([w for w in rc.replace(",", " ").replace("/", " ").split() if len(w) > 3])
-        overlap = len(req_words & rc_words)
-        union   = max(1, len(req_words | rc_words))
-        jaccard = overlap / union
-        if jaccard >= 0.20:  # modest bar because of paraphrase
-            good += 1
-    mapping = pct(good, total if total > 0 else 1)
+        rc  = str(row.get("HA Risk Control",""))
+        if req.strip() and rc.strip():
+            total += 1
+            if _mapped(req, rc):
+                mapped_count += 1
+    mapping = pct(mapped_count, total if total else 1)
     return {"completeness": completeness, "mapping": mapping}
 
 
-# ---------------- Title & Images ----------------
-# Find images in /app/assets or /streamlit_assets
-def _img_path(name: str) -> t.Optional[str]:
-    for p in [Path("app/assets")/name, Path("streamlit_assets")/name, Path("assets")/name]:
-        if p.exists():
-            return str(p)
-    return None
+# ---------------- UI ----------------
 
-col_hd1, col_hd2 = st.columns([0.7, 0.3])
-with col_hd1:
-    st.markdown('<div class="heading-tight">', unsafe_allow_html=True)
-    st.title("DHF Automation – Infusion Pump")
-    st.caption("Requirements → Hazard Analysis → DVP → TM")
-    st.markdown('</div>', unsafe_allow_html=True)
-with col_hd2:
-    c1, c2 = st.columns(2)
-    imgA = _img_path("Infusion1.jpg")
-    imgB = _img_path("Infusion.jpg")
-    if imgA:
-        c1.image(imgA)
-    if imgB:
-        c2.image(imgB)
+st.set_page_config(page_title="DHF Automation – Infusion Pump", layout="wide")
 
-st.markdown("---")
+# Title row with icon + purple title + two images nearby
+c1, c2, c3 = st.columns([6, 2, 2])
+with c1:
+    icon_html = ""
+    if os.path.exists(ICON_SVG):
+        with open(ICON_SVG, "r", encoding="utf-8") as f:
+            icon_html = f.read()
+    else:
+        icon_html = "🧩"
+    st.markdown(
+        f"""
+        <div style="display:flex;align-items:center;gap:14px;">
+            <div style="width:36px;height:36px;line-height:36px;font-size:28px;">{icon_html}</div>
+            <h1 style="margin:0;color:#6F42C1;">DHF Automation – Infusion Pump</h1>
+        </div>
+        <div style="color:#6b6f76;margin-top:6px;">Requirements → Hazard Analysis → DVP → TM</div>
+        """,
+        unsafe_allow_html=True,
+    )
+with c2:
+    if os.path.exists(IMG_LEFT):
+        st.image(IMG_LEFT, caption=None, use_container_width=True)
+with c3:
+    if os.path.exists(IMG_RIGHT):
+        st.image(IMG_RIGHT, caption=None, use_container_width=True)
 
-# ---------------- Input Section ----------------
+st.markdown("")
+
 st.markdown("**Provide Product Requirements** (choose one):")
 colA, colB = st.columns(2)
 with colA:
@@ -317,11 +292,8 @@ with colB:
     sample = "Requirement ID,Verification ID,Requirements\nPR-001,VER-001,System shall ..."
     pasted = st.text_area("Paste as CSV (with headers)", value="", height=140, placeholder=sample)
 
-# Single green primary button
-run_btn = st.button("▶️ Generate DHF Packages", type="primary")
-
-# area for immediate success text after download
-download_msg_slot = st.empty()
+# Primary action button
+run_btn = st.button("🟩 Generate DHF Packages", type="primary")
 
 if run_btn:
     # -------- Parse Requirements --------
@@ -369,13 +341,20 @@ if run_btn:
         ha_rows = ha_resp.get("ha", [])
         ha_df = pd.DataFrame(ha_rows)
 
+    ha_df = fill_tbd(
+        ha_df,
+        [
+            "requirement_id", "risk_id", "risk_to_health", "hazard", "hazardous_situation",
+            "harm", "sequence_of_events", "severity_of_harm", "p0", "p1", "poh", "risk_index", "risk_control",
+        ],
+    )
     st.subheader(f"Hazard Analysis (preview, first {HA_MAX_ROWS})")
     st.dataframe(head_cap(ha_df, HA_MAX_ROWS), use_container_width=True)
 
     # -------- Call Backend: DVP --------
     with st.spinner("Generating Design Verification Protocol (backend)..."):
         dvp_payload = {
-            "requirements": ha_payload["requirements"],
+            "requirements": ha_payload["requirements"],  # already limited
             "ha": ha_rows,
         }
     try:
@@ -386,13 +365,14 @@ if run_btn:
         st.stop()
     dvp_df = pd.DataFrame(dvp_rows)
 
+    dvp_df = fill_tbd(dvp_df, ["verification_id", "requirement_id", "requirements", "verification_method", "sample_size", "test_procedure", "acceptance_criteria"])
     st.subheader(f"Design Verification Protocol (preview, first {DVP_MAX_ROWS})")
     st.dataframe(head_cap(dvp_df, DVP_MAX_ROWS), use_container_width=True)
 
     # -------- Call Backend: TM --------
     with st.spinner("Building Trace Matrix (backend)..."):
         tm_payload = {
-            "requirements": ha_payload["requirements"],
+            "requirements": ha_payload["requirements"],  # already limited
             "ha": ha_rows,
             "dvp": dvp_rows,
         }
@@ -400,7 +380,6 @@ if run_btn:
         tm_rows = tm_resp.get("tm", [])
         tm_df = pd.DataFrame(tm_rows)
 
-    # enforce TM column order for preview/export
     TM_ORDER = [
         "Requirement ID",
         "Requirements",
@@ -413,92 +392,85 @@ if run_btn:
         "Acceptance Criteria",
     ]
     tm_df = tm_df.reindex(columns=TM_ORDER)
+    tm_df = fill_tbd(tm_df, TM_ORDER)
 
     st.subheader(f"Trace Matrix (preview, first {TM_MAX_ROWS})")
     st.dataframe(head_cap(tm_df, TM_MAX_ROWS), use_container_width=True)
 
-    # -------- Evaluation Metrics (colored + thresholds) --------
-    st.subheader("Evaluation Metrics")
+    # -------- Evaluation Metrics (colored vs thresholds) --------
+    ha = ha_metrics(ha_df)
+    dvp = dvp_metrics(dvp_df)
+    tm  = tm_metrics(tm_df)
+
+    T_HA_COMP = 80
+    T_HA_DIV  = 70
+    T_DVP_COMP = 80
+    T_DVP_MAP  = 70  # severity↔sample alignment (we computed measurable before; keeping name generic)
+    T_TM_COMP = 80
+    T_TM_MAP  = 80
+
+    def color_pct(val: float, thr: float) -> str:
+        color = "#1E874B" if val >= thr else "#C62828"
+        return f"<span style='color:{color};font-weight:700'>{val:.1f}%</span>"
+
+    st.markdown("## Evaluation Metrics")
     st.markdown(
-        "Objective: these metrics quickly summarize **coverage**, **consistency**, and "
-        "**requirement↔control mapping** quality across the generated documents."
+        "Objective: these metrics quickly summarize **coverage**, **consistency**, and **requirement↔control mapping** quality across the generated documents."
+    )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(f"**HA • Completeness (Threshold: {T_HA_COMP}%)**")
+        st.markdown(color_pct(ha.get("completeness", 0.0), T_HA_COMP), unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"**DVP • Field Completeness (Threshold: {T_DVP_COMP}%)**")
+        st.markdown(color_pct(dvp.get("completeness", 0.0), T_DVP_COMP), unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"**TM • Req↔RiskControl Mapping (Threshold: {T_TM_MAP}%)**")
+        st.markdown(color_pct(tm.get("mapping", 0.0), T_TM_MAP), unsafe_allow_html=True)
+
+    c4, c5 = st.columns(2)
+    with c4:
+        st.markdown(f"**HA • Scenario Diversity (Threshold: {T_HA_DIV}%)**")
+        st.markdown(color_pct(ha.get("diversity", 0.0), T_HA_DIV), unsafe_allow_html=True)
+    with c5:
+        st.markdown(f"**TM • Field Completeness (Threshold: {T_TM_COMP}%)**")
+        st.markdown(color_pct(tm.get("completeness", 0.0), T_TM_COMP), unsafe_allow_html=True)
+
+    st.markdown(
+        "<div style='margin-top:12px;font-weight:700;color:#0B5ED7;'>Note: Please involve Medical Device SMEs for final review of these documents before approval.</div>",
+        unsafe_allow_html=True,
     )
 
-    ha_m = ha_metrics(ha_df)
-    dvp_m = dvp_metrics(dvp_df, ha_df)
-    tm_m  = tm_metrics(tm_df)
-
-    row1 = st.columns(3)
-    with row1[0]:
-        st.markdown(render_metric("HA • Completeness", ha_m["completeness"], HA_COMPLETENESS_T), unsafe_allow_html=True)
-    with row1[1]:
-        st.markdown(render_metric("DVP • Field Completeness", dvp_m["completeness"], DVP_COMPLETENESS_T), unsafe_allow_html=True)
-    with row1[2]:
-        st.markdown(render_metric("TM • Req↔RiskControl Mapping", tm_m["mapping"], TM_MAPPING_T), unsafe_allow_html=True)
-
-    row2 = st.columns(3)
-    with row2[0]:
-        st.markdown(render_metric("HA • Scenario Diversity", ha_m["diversity"], HA_DIVERSITY_T), unsafe_allow_html=True)
-    with row2[1]:
-        st.markdown(render_metric("DVP • Severity↔Sample Alignment", dvp_m["sev_sample"], DVP_SEV_SAMPLE_T), unsafe_allow_html=True)
-    with row2[2]:
-        # also show TM completeness on row2/right for balance
-        st.markdown(render_metric("TM • Field Completeness", tm_m["completeness"], DVP_COMPLETENESS_T), unsafe_allow_html=True)
-
-    st.markdown(
-        "<p class='kpi-note'>Note: Please involve Medical Device SMEs for final review of these documents before approval.</p>",
-        unsafe_allow_html=True
-    )
-
-    # -------- Prepare styled Excel exports (capped for preview) --------
-    # Column widths per your spec:
-    #   • DVP: all 15 except Acceptance Criteria & Test Procedure & Requirements → 100
-    #   • HA : all 15 except Risk control → 100, Hazardous situation & Sequence of events → 40
-    #   • TM : all 15 except Requirements & HA Risk Control → 100
+    # -------- Prepare styled Excel exports (capped) --------
     ha_export_cols = [
         "requirement_id", "risk_id", "risk_to_health", "hazard", "hazardous_situation",
         "harm", "sequence_of_events", "severity_of_harm", "p0", "p1", "poh", "risk_index", "risk_control",
     ]
-    # map missing columns gracefully
-    ha_export = head_cap(ha_df[ [c for c in ha_export_cols if c in ha_df.columns] ], HA_MAX_ROWS)
-    ha_bytes = df_to_excel_bytes_styled(
-        ha_export,
-        long_cols={
-            "risk_control": 100,
-            "hazardous_situation": 40,
-            "sequence_of_events": 40,
-        },
-        freeze_cell="D2",
-        default_col_width=15
-    )
+    dvp_export_cols = ["verification_id", "requirement_id", "requirements", "verification_method", "sample_size", "test_procedure", "acceptance_criteria"]
+    tm_export_cols = TM_ORDER[:]
 
-    dvp_export_cols = ["verification_id", "requirement_id", "requirements", "verification_method",
-                       "sample_size", "test_procedure", "acceptance_criteria"]
-    dvp_export = head_cap(dvp_df[ [c for c in dvp_export_cols if c in dvp_df.columns] ], DVP_MAX_ROWS)
-    dvp_bytes = df_to_excel_bytes_styled(
-        dvp_export,
-        long_cols={
-            "requirements": 100,
-            "test_procedure": 100,
-            "acceptance_criteria": 100
-        },
-        freeze_cell="D2",
-        default_col_width=15
-    )
+    # Widths per your latest ask
+    ha_widths = {c: 15 for c in ha_export_cols}
+    ha_widths["risk_control"] = 100
+    ha_widths["hazardous_situation"] = 40
+    ha_widths["sequence_of_events"] = 40
 
-    tm_export_cols = TM_ORDER[:]  # same order as preview
-    tm_export = head_cap(tm_df[tm_export_cols], TM_MAX_ROWS)
-    tm_bytes  = df_to_excel_bytes_styled(
-        tm_export,
-        long_cols={
-            "Requirements": 100,
-            "HA Risk Control": 100
-        },
-        freeze_cell="D2",
-        default_col_width=15
-    )
+    dvp_widths = {c: 15 for c in dvp_export_cols}
+    dvp_widths["requirements"] = 60
+    dvp_widths["test_procedure"] = 60
+    # keep others narrow; acceptance_criteria stays 15 per latest request
+    # DVP row height 60:
+    dvp_row_height = 60
 
-    # Save locally
+    tm_widths = {c: 15 for c in tm_export_cols}
+    tm_widths["Requirements"] = 100
+    tm_widths["HA Risk Control"] = 100
+
+    ha_bytes = df_to_excel_bytes_with_style(head_cap(ha_df[ha_export_cols], HA_MAX_ROWS), ha_widths, row_height=30)
+    dvp_bytes = df_to_excel_bytes_with_style(head_cap(dvp_df[dvp_export_cols], DVP_MAX_ROWS), dvp_widths, row_height=dvp_row_height)
+    tm_bytes  = df_to_excel_bytes_with_style(head_cap(tm_df[tm_export_cols], TM_MAX_ROWS),  tm_widths,  row_height=30)
+
+    # Save locally too
     with open(os.path.join(OUTPUT_DIR, "Hazard_Analysis.xlsx"), "wb") as f:
         f.write(ha_bytes)
     with open(os.path.join(OUTPUT_DIR, "Design_Verification_Protocol.xlsx"), "wb") as f:
@@ -523,14 +495,12 @@ if run_btn:
         type="primary"
     )
     if clicked:
-        download_msg_slot.markdown(
-            "<div style='margin-top:6px; font-weight:800;'>"
-            "DHF documents downloaded successfully - Hazard Analysis, Design Verification Protocol, Trace Matrix"
-            "</div>",
-            unsafe_allow_html=True
+        st.markdown(
+            "<div style='margin-top:8px;font-weight:800;'>DHF documents downloaded successfully - Hazard Analysis, Design Verification Protocol, Trace Matrix</div>",
+            unsafe_allow_html=True,
         )
 
-    # -------- Optional Google Drive upload (silent UI) --------
+    # -------- Optional Google Drive upload --------
     if DEFAULT_DRIVE_FOLDER_ID:
         with st.spinner("Uploading files to Google Drive..."):
             drive = init_drive()
